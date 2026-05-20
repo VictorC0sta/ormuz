@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 import logging
 from dataclasses import asdict
 from concurrent.futures import ThreadPoolExecutor
@@ -7,10 +8,9 @@ from concurrent.futures import ThreadPoolExecutor
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared"))
 
 # pylint: disable=import-error, wrong-import-position
-from protocolo import notificar_monitor
+from protocolo import notificar_monitor, criar_servidor_tcp, tcp_receber_completo, tcp_broadcast
 from constantes import TipoMensagem
 from mensagens import MensagemRequisicao
-from protocolo import criar_servidor_tcp, tcp_receber_completo, tcp_broadcast
 from lamport import LamportClock
 
 # ── Logging ──────────────────────────────────────────────────────────────────
@@ -38,8 +38,11 @@ PORTA_BASE_SUL   = int(os.environ.get("PORTA_BASE_SUL",   "6002"))
 PORTA_BASE_LESTE = int(os.environ.get("PORTA_BASE_LESTE", "6003"))
 PORTA_BASE_OESTE = int(os.environ.get("PORTA_BASE_OESTE", "6004"))
 
-# "LESTE,NORTE,SUL,OESTE" → usado só para log, a ordem real fica nas bases
 PRIORIDADE = os.environ.get("PRIORIDADE", "NORTE,SUL,LESTE,OESTE")
+
+# Quantas vezes tentar reenviar para bases que não responderam
+BROADCAST_MAX_TENTATIVAS = int(os.environ.get("BROADCAST_MAX_TENTATIVAS", "3"))
+BROADCAST_RETRY_DELAY_S  = float(os.environ.get("BROADCAST_RETRY_DELAY_S", "1.0"))
 
 # ── Destinos de broadcast (todas as 4 bases) ──────────────────────────────────
 
@@ -55,12 +58,65 @@ BASES: list[tuple[str, int]] = [
 clock = LamportClock()
 
 
+# ── Broadcast com retry ───────────────────────────────────────────────────────
+
+def broadcast_com_retry(payload: dict) -> dict[str, bool]:
+    """
+    Tenta entregar o payload para todas as bases.
+
+    Protocolo de tolerância a falhas de comunicação:
+    - Primeira tentativa: broadcast simultâneo para todas as 4 bases.
+    - Tentativas seguintes: apenas para as bases que falharam na tentativa anterior.
+    - Espera BROADCAST_RETRY_DELAY_S entre tentativas.
+    - Após BROADCAST_MAX_TENTATIVAS sem sucesso numa base, registra falha e segue.
+
+    Justificativa: uma base temporariamente offline não pode bloquear o despacho
+    para as demais. O sistema continua operando com 3 das 4 bases — o drone menos
+    prioritário simplesmente não tem a oportunidade de aceitar naquela rodada.
+    """
+    resultados_finais: dict[str, bool] = {}
+    pendentes = list(BASES)
+
+    for tentativa in range(1, BROADCAST_MAX_TENTATIVAS + 1):
+        if not pendentes:
+            break
+
+        parcial = tcp_broadcast(pendentes, payload)
+        resultados_finais.update(parcial)
+
+        falhas = [(h, p) for (h, p) in pendentes if not parcial.get(f"{h}:{p}", False)]
+
+        enviados = len(pendentes) - len(falhas)
+        logger.info(
+            "[%s] Broadcast tentativa %d/%d — %d/%d bases alcançadas%s",
+            SETOR_ID, tentativa, BROADCAST_MAX_TENTATIVAS,
+            enviados, len(pendentes),
+            f" | {len(falhas)} offline, aguardando {BROADCAST_RETRY_DELAY_S}s para retry" if falhas else "",
+        )
+
+        if not falhas:
+            break
+
+        pendentes = falhas
+        if tentativa < BROADCAST_MAX_TENTATIVAS:
+            time.sleep(BROADCAST_RETRY_DELAY_S)
+
+    if pendentes:
+        logger.warning(
+            "[%s] Bases não alcançadas após %d tentativas: %s",
+            SETOR_ID, BROADCAST_MAX_TENTATIVAS,
+            [f"{h}:{p}" for h, p in pendentes],
+        )
+
+    return resultados_finais
+
+
 # ── Processamento de alertas ──────────────────────────────────────────────────
 
 def processar_alerta(msg: dict):
     """
     Recebe um alerta do sensor, cria uma requisição com timestamp de Lamport
-    e faz broadcast para todas as bases simultaneamente.
+    e faz broadcast com retry para todas as bases.
     """
     tipo = msg.get("tipo")
 
@@ -68,11 +124,10 @@ def processar_alerta(msg: dict):
         logger.warning("[%s] Mensagem ignorada — tipo inesperado: %s", SETOR_ID, tipo)
         return
 
-    # Incrementa Lamport antes de criar a requisição
     ts = clock.incrementar()
 
     requisicao = MensagemRequisicao(
-        id_setor        = SETOR_ID,
+        id_setor         = SETOR_ID,
         timestamp_logico = ts,
         criticidade      = msg.get("criticidade", "BAIXA"),
         tipo_ocorrencia  = msg.get("tipo_ocorrencia", "anomalia_menor"),
@@ -89,64 +144,41 @@ def processar_alerta(msg: dict):
         ts,
     )
 
-    # Broadcast simultâneo para as 4 bases
-    resultados = tcp_broadcast(BASES, payload)
+    broadcast_com_retry(payload)
 
-    enviados  = sum(1 for ok in resultados.values() if ok)
-    falhas    = len(resultados) - enviados
-
-    logger.info(
-        "[%s] Broadcast concluído — %d/4 bases alcançadas%s",
-        SETOR_ID,
-        enviados,
-        f" ({falhas} offline)" if falhas else "",
-    )
-    
     notificar_monitor({
-    "tipo": "ALERTA_GERADO", 
-    "setor": SETOR_ID, 
-    "criticidade": requisicao.criticidade
-})
+        "tipo": "ALERTA_GERADO",
+        "setor": SETOR_ID,
+        "criticidade": requisicao.criticidade,
+    })
+
 
 # ── Loop servidor TCP ─────────────────────────────────────────────────────────
 
 def loop_servidor():
-    """
-    Aceita conexões TCP dos sensores.
-    Cada alerta é processado em thread separada via ThreadPoolExecutor
-    para não bloquear o accept() durante o broadcast.
-    """
     servidor = criar_servidor_tcp(MINHA_PORTA)
     logger.info(
         "[%s — %s] Broker iniciado na porta %d | prioridade: %s",
         SETOR_ID, SETOR_NOME, MINHA_PORTA, PRIORIDADE,
     )
 
-    # Pool com 4 workers: suficiente para processar alertas simultâneos
-    # sem criar threads ilimitadas
     with ThreadPoolExecutor(max_workers=4, thread_name_prefix="alerta") as pool:
         while True:
             try:
                 conn, addr = servidor.accept()
-
-                # Leitura e processamento em thread separada
                 pool.submit(_tratar_conexao, conn, addr)
-
             except Exception as e:
                 logger.error("[%s] Erro no accept: %s", SETOR_ID, e, exc_info=True)
 
 
 def _tratar_conexao(conn, addr):
-    """Lê a mensagem de uma conexão aceita e despacha para processamento."""
     try:
         msg = tcp_receber_completo(conn)
         conn.close()
-
         if msg:
             processar_alerta(msg)
         else:
             logger.warning("[%s] Conexão vazia de %s", SETOR_ID, addr)
-
     except Exception as e:
         logger.error("[%s] Erro ao tratar conexão de %s: %s", SETOR_ID, addr, e, exc_info=True)
 
@@ -155,12 +187,14 @@ def _tratar_conexao(conn, addr):
 
 def main():
     logger.info(
-        "[%s] Inicializando broker de setor | Bases: Norte=%s:%d Sul=%s:%d Leste=%s:%d Oeste=%s:%d",
+        "[%s] Inicializando broker | Bases: Norte=%s:%d Sul=%s:%d Leste=%s:%d Oeste=%s:%d | retry=%dx @ %.1fs",
         SETOR_ID,
         IP_BASE_NORTE, PORTA_BASE_NORTE,
         IP_BASE_SUL,   PORTA_BASE_SUL,
         IP_BASE_LESTE, PORTA_BASE_LESTE,
         IP_BASE_OESTE, PORTA_BASE_OESTE,
+        BROADCAST_MAX_TENTATIVAS,
+        BROADCAST_RETRY_DELAY_S,
     )
     loop_servidor()
 

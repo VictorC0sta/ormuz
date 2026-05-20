@@ -3,13 +3,15 @@ import struct
 import json
 import logging
 from typing import Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 
 logger = logging.getLogger(__name__)
 
 # ── Constantes de rede ───────────────────────────────────────────────────────
-BUFFER_UDP  = 4096      
-TIMEOUT_TCP = 5.0       
+BUFFER_UDP  = 4096
+TIMEOUT_TCP = 2.0   # Reduzido de 5s para 2s: broadcast não pode travar o sistema
+
 
 def tcp_enviar(host: str, porta: int, payload: dict) -> bool:
     try:
@@ -19,7 +21,6 @@ def tcp_enviar(host: str, porta: int, payload: dict) -> bool:
         with socket.create_connection((host, porta), timeout=TIMEOUT_TCP) as s:
             s.sendall(header + dados)
 
-        # Lazy formatting: use %s e passe as variáveis como argumentos
         logger.debug("[TCP] Enviado para %s:%s — %d bytes", host, porta, len(dados))
         return True
 
@@ -29,10 +30,27 @@ def tcp_enviar(host: str, porta: int, payload: dict) -> bool:
 
 
 def tcp_broadcast(destinos: list[tuple[str, int]], payload: dict) -> dict[str, bool]:
-    resultados = {}
+    resultados: dict[str, bool] = {}
+
+    with ThreadPoolExecutor(max_workers=len(destinos), thread_name_prefix="broadcast") as pool:
+        futuros = {
+            pool.submit(tcp_enviar, host, porta, payload): f"{host}:{porta}"
+            for host, porta in destinos
+        }
+        for futuro in as_completed(futuros, timeout=TIMEOUT_TCP + 1):
+            chave = futuros[futuro]
+            try:
+                resultados[chave] = futuro.result()
+            except Exception as e:
+                logger.warning("[TCP broadcast] Exceção para %s: %s", chave, e)
+                resultados[chave] = False
+
+    # Garante que destinos que não responderam no timeout também entrem como False
     for host, porta in destinos:
         chave = f"{host}:{porta}"
-        resultados[chave] = tcp_enviar(host, porta, payload)
+        if chave not in resultados:
+            resultados[chave] = False
+
     return resultados
 
 
@@ -100,15 +118,14 @@ def criar_servidor_udp(porta: int) -> socket.socket:
     logger.info("[UDP] Servidor ouvindo na porta %d", porta)
     return s
 
+
 def notificar_monitor(evento: dict):
-    """Envia um evento para a interface gráfica (Pygame) via UDP."""
-    # O IP do computador que estará rodando a janela do Pygame
-    ip_monitor = os.environ.get("IP_MONITOR", "127.0.0.1") 
+    """Envia um evento para a interface gráfica via UDP. Falha silenciosa se o monitor não estiver ativo."""
+    ip_monitor = os.environ.get("IP_MONITOR", "127.0.0.1")
     porta_monitor = 8000
-    
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.sendto(json.dumps(evento).encode("utf-8"), (ip_monitor, porta_monitor))
         sock.close()
     except Exception:
-        pass # Se o monitor não estiver rodando, ignora silenciosamente
+        pass
