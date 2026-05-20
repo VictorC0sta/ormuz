@@ -7,8 +7,6 @@
     <style>
     * { box-sizing: border-box; }
     body { margin: 0; background-color: #1e1e1e; color: #e0e0e0; }
-    
-    /* Variáveis de cor para garantir que o painel fique bonito no tema escuro */
     :root {
       --color-background-primary: #121212;
       --color-background-secondary: #1e1e1e;
@@ -16,7 +14,6 @@
       --color-background-warning: #332711;
       --color-background-danger: #331414;
       --color-background-info: #11263d;
-      
       --color-border-primary: #555;
       --color-border-secondary: #333;
       --color-border-tertiary: #222;
@@ -24,7 +21,6 @@
       --color-border-warning: #d29922;
       --color-border-danger: #f85149;
       --color-border-info: #388bfd;
-      
       --color-text-primary: #e6edf3;
       --color-text-secondary: #8b949e;
       --color-text-tertiary: #6e7681;
@@ -32,21 +28,18 @@
       --color-text-warning: #d29922;
       --color-text-danger: #f85149;
       --color-text-info: #58a6ff;
-      
       --border-radius-md: 4px;
       --border-radius-lg: 8px;
       --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
       --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
     }
-
     select, input[type=text], input[type=number] {
       width: 100%; padding: 6px 10px; font-size: 12px;
       background: var(--color-background-primary);
       color: var(--color-text-primary);
       border: 0.5px solid var(--color-border-secondary);
       border-radius: var(--border-radius-md);
-      font-family: var(--font-sans);
-      margin: 0;
+      font-family: var(--font-sans); margin: 0;
     }
     select:focus, input:focus { outline: none; border-color: var(--color-border-primary); }
     button {
@@ -67,9 +60,7 @@
     </style>
 </head>
 <body>
-
 <div id="app" style="font-family:var(--font-sans);padding:1rem"></div>
-
 <script>
 (function() {
 const PRIORITY_TABLE = {
@@ -103,6 +94,8 @@ let STATE = {
     {id:"DRONE-LESTE-1",base:"LESTE",state:"LIVRE",mission:null,port:7021},
     {id:"DRONE-OESTE-1",base:"OESTE",state:"LIVRE",mission:null,port:7031}
   ],
+  // ── NOVO: estado de cada base (true = online, false = offline/derrubada)
+  bases: {NORTE:true, SUL:true, LESTE:true, OESTE:true},
   queue: [],
   events: [],
   lamport: 0,
@@ -136,11 +129,16 @@ function log(msg, level="info") {
   if(STATE.events.length>150) STATE.events.length=150;
 }
 
+// ── FIX #1: processQueue agora:
+//   a) só usa drones de bases ONLINE (STATE.bases[d.base])
+//   b) só libera o drone no callback se ele ainda estiver OCUPADO
+//      (evita reviver drones derrubados mid-missão)
 function processQueue() {
   const pending = STATE.queue.filter(r=>r.status==="PENDENTE");
   if(!pending.length) return;
   const sorted = sortByPriority(pending);
-  const free = STATE.drones.find(d=>d.state==="LIVRE");
+  // a) filtra por base online
+  const free = STATE.drones.find(d=>d.state==="LIVRE" && STATE.bases[d.base]);
   if(!free) return;
   const req = sorted[0];
   const ts = lamportClock;
@@ -149,13 +147,19 @@ function processQueue() {
   log(`[${free.base}] Aceitou ${req.id} -> ${free.id.split("-").slice(1).join("-")} | L=${ts}`,"success");
   STATE.stats.aceitas++;
   const dur = 8000+Math.random()*12000;
+  // b) captura referência e checa estado antes de liberar
+  const capturedDrone = free;
+  const capturedReq = req;
   setTimeout(()=>{
-    free.state="LIVRE"; free.mission=null;
-    req.status="CONCLUIDA";
-    log(`Missao ${req.id} concluida por ${free.id.split("-").slice(1).join("-")}`,"success");
-    STATE.stats.concluidas++;
-    setTimeout(processQueue,100);
-    render();
+    // só libera se o drone ainda estiver OCUPADO (não foi derrubado)
+    if(capturedDrone.state === "OCUPADO") {
+      capturedDrone.state="LIVRE"; capturedDrone.mission=null;
+      capturedReq.status="CONCLUIDA";
+      log(`Missao ${capturedReq.id} concluida por ${capturedDrone.id.split("-").slice(1).join("-")}`,"success");
+      STATE.stats.concluidas++;
+      setTimeout(processQueue,100);
+      render();
+    }
   }, dur);
 }
 
@@ -170,7 +174,9 @@ function injectAlert(sector, tipo, crit) {
   STATE.queue = sortByPriority(STATE.queue);
   STATE.lamport = lamportClock;
   const order = PRIORITY_TABLE[sector]||["NORTE","SUL","LESTE","OESTE"];
-  const pos = (order.indexOf("NORTE")+1)||4;
+  // determina posição de prioridade levando em conta bases offline
+  const onlineOrder = order.filter(b=>STATE.bases[b]);
+  const pos = onlineOrder.length > 0 ? 1 : 4;
   const tmo = TIMEOUT_MS[pos]??600;
   setTimeout(()=>{ processQueue(); render(); }, tmo+50);
   render();
@@ -225,6 +231,7 @@ function killDrone(droneId) {
     if(req){req.status="PENDENTE";req.drone=null;}
     log(`Missao ${d.mission} devolvida a fila`,"info");
     d.mission=null;
+    // FIX #1 aplicado aqui também: só processa fila se houver base online com drone livre
     setTimeout(()=>{processQueue();render();},300);
   }
   render();
@@ -232,7 +239,14 @@ function killDrone(droneId) {
 
 function reviveDrone(droneId) {
   const d=STATE.drones.find(x=>x.id===droneId);
-  if(d){d.state="LIVRE";d.mission=null;}
+  if(!d) return;
+  // só revive se a base do drone estiver online
+  if(!STATE.bases[d.base]) {
+    log(`Drone ${droneId.split("-").slice(1).join("-")} nao pode reviver — base ${d.base} offline`,"warn");
+    render();
+    return;
+  }
+  d.state="LIVRE"; d.mission=null;
   log(`Drone ${droneId.split("-").slice(1).join("-")} reconectado`,"success");
   setTimeout(()=>{processQueue();render();},200);
   render();
@@ -241,6 +255,42 @@ function reviveDrone(droneId) {
 function removeDrone(droneId) {
   STATE.drones=STATE.drones.filter(d=>d.id!==droneId);
   log(`Drone ${droneId.split("-").slice(1).join("-")} removido`,"warn");
+  render();
+}
+
+// ── NOVO: killBase / reviveBase ───────────────────────────────────────────────
+
+function killBase(baseId) {
+  if(!STATE.bases[baseId]) return;
+  STATE.bases[baseId] = false;
+  // Derruba todos os drones da base (os OCUPADOS devolvem missão à fila via killDrone)
+  STATE.drones
+    .filter(d => d.base === baseId && d.state !== "PERDIDO")
+    .forEach(d => {
+      d.state = "PERDIDO";
+      STATE.stats.perdidos++;
+      if(d.mission) {
+        const req = STATE.queue.find(r => r.id === d.mission);
+        if(req){ req.status="PENDENTE"; req.drone=null; }
+        log(`Missao ${d.mission} devolvida — base ${baseId} caiu`,"info");
+        d.mission = null;
+      }
+    });
+  log(`⚠ Base ${baseId} DESATIVADA — todos os drones offline`,"warn");
+  // tenta realocar pendentes nas bases restantes
+  setTimeout(()=>{processQueue();render();},300);
+  render();
+}
+
+function reviveBase(baseId) {
+  if(STATE.bases[baseId]) return;
+  STATE.bases[baseId] = true;
+  // Revive os drones PERDIDOS dessa base
+  STATE.drones
+    .filter(d => d.base === baseId && d.state === "PERDIDO")
+    .forEach(d => { d.state="LIVRE"; d.mission=null; });
+  log(`✔ Base ${baseId} RESTAURADA — drones reconectados`,"success");
+  setTimeout(()=>{processQueue();render();},200);
   render();
 }
 
@@ -313,25 +363,30 @@ function renderMap() {
     </g>`;
   });
 
-  // Base labels and drone icons
   const bases=["NORTE","SUL","LESTE","OESTE"];
   let baseLabels="";
   bases.forEach(base=>{
+    const online = STATE.bases[base];
     const drs=STATE.drones.filter(d=>d.base===base);
     const free=drs.filter(d=>d.state==="LIVRE").length;
     const lost=drs.filter(d=>d.state==="PERDIDO").length;
-    const col=lost>0?"var(--color-text-danger)":free>0?"var(--color-text-success)":"var(--color-text-warning)";
+    // ── NOVO: base offline = sempre vermelho + risco visual
+    const col = !online ? "var(--color-text-danger)"
+               : lost>0 ? "var(--color-text-danger)"
+               : free>0 ? "var(--color-text-success)"
+               : "var(--color-text-warning)";
     let bx,by,anchor="middle";
     if(base==="NORTE"){bx=totalW/2;by=13;}
     else if(base==="SUL"){bx=totalW/2;by=totalH-4;}
     else if(base==="OESTE"){bx=3;by=totalH/2-5;anchor="start";}
     else{bx=totalW-3;by=totalH/2-5;anchor="end";}
-    baseLabels+=`<text x="${bx}" y="${by}" text-anchor="${anchor}" style="font-size:8px;font-weight:500;font-family:var(--font-mono)" fill="${col}">${base} [${free}/${drs.length}]</text>`;
+    // label com indicador OFFLINE
+    const label = online ? `${base} [${free}/${drs.length}]` : `${base} ✕OFFLINE`;
+    baseLabels+=`<text x="${bx}" y="${by}" text-anchor="${anchor}" style="font-size:8px;font-weight:500;font-family:var(--font-mono)" fill="${col}">${label}</text>`;
 
-    // Drone triangles
     drs.forEach((drone,i)=>{
-      const stC=c_state(drone.state);
-      const op=drone.state==="PERDIDO"?0.35:1;
+      const stC = !online ? "var(--color-text-danger)" : c_state(drone.state);
+      const op = (!online || drone.state==="PERDIDO") ? 0.25 : 1;
       let dx,dy;
       if(base==="NORTE"){dx=totalW/2-((drs.length-1)*8)+i*16;dy=20;}
       else if(base==="SUL"){dx=totalW/2-((drs.length-1)*8)+i*16;dy=totalH-14;}
@@ -342,25 +397,24 @@ function renderMap() {
   });
 
   return `<svg width="100%" viewBox="0 0 ${totalW} ${totalH}" style="display:block">
-    ${baseLabels}
-    ${sectors}
-    ${dronePts}
+    ${baseLabels}${sectors}${dronePts}
   </svg>`;
 }
 
 function renderDroneCard(d) {
   const shortId=d.id.replace("DRONE-","");
   const mShort=d.mission?d.mission.slice(0,6):"—";
-  return `<div style="display:flex;align-items:center;gap:8px;padding:7px 10px;border-radius:var(--border-radius-md);background:var(--color-background-primary);border:0.5px solid var(--color-border-tertiary);margin-bottom:5px">
+  const baseOnline = STATE.bases[d.base];
+  return `<div style="display:flex;align-items:center;gap:8px;padding:7px 10px;border-radius:var(--border-radius-md);background:var(--color-background-primary);border:0.5px solid var(--color-border-tertiary);margin-bottom:5px;opacity:${!baseOnline?'0.55':'1'}">
     <div style="width:8px;height:8px;border-radius:50%;flex-shrink:0;background:${c_state(d.state)}"></div>
     <div style="flex:1;min-width:0">
       <div class="mono" style="font-size:11px;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--color-text-primary)">${d.id}</div>
-      <div style="font-size:10px;color:var(--color-text-secondary)">Base: ${d.base} · P:${d.port} · Missao:${mShort}</div>
+      <div style="font-size:10px;color:var(--color-text-secondary)">Base: ${d.base}${!baseOnline?' <span style="color:var(--color-text-danger)">[OFFLINE]</span>':''} · P:${d.port} · Missao:${mShort}</div>
     </div>
     <span class="badge" style="background:${bg_state(d.state)};color:${c_state(d.state)};border-color:${c_state(d.state)}22">${d.state}</span>
     <div style="display:flex;gap:4px;flex-shrink:0">
-      ${d.state==="PERDIDO"?`<button onclick="reviveDrone('${d.id}')" style="font-size:10px;padding:2px 7px;color:var(--color-text-success)">↺ Reconectar</button>`:""}
-      ${d.state==="LIVRE"?`<button onclick="killDrone('${d.id}')" style="font-size:10px;padding:2px 7px;color:var(--color-text-danger)">✕ Derrubar</button>`:""}
+      ${d.state==="PERDIDO"&&baseOnline?`<button onclick="reviveDrone('${d.id}')" style="font-size:10px;padding:2px 7px;color:var(--color-text-success)">↺ Reconectar</button>`:""}
+      ${d.state==="LIVRE"&&baseOnline?`<button onclick="killDrone('${d.id}')" style="font-size:10px;padding:2px 7px;color:var(--color-text-danger)">✕ Derrubar</button>`:""}
       ${d.state!=="OCUPADO"?`<button onclick="removeDrone('${d.id}')" style="font-size:10px;padding:2px 5px">−</button>`:""}
     </div>
   </div>`;
@@ -443,31 +497,64 @@ function renderTabContent() {
       :`<button onclick="startBombard()" style="width:100%;padding:9px;font-weight:500;background:var(--color-background-warning);color:var(--color-text-warning);border-color:var(--color-border-warning)22">Iniciar Bombardeamento</button>`}`;
 
   if(STATE.tab==="drone") return `
-    <p style="margin:0 0 10px;font-size:12px;color:var(--color-text-secondary)">Adicione drones ao sistema. Ao incluir, a fila é consultada e reprocessada automaticamente.</p>
-    <div style="margin-bottom:8px"><label style="font-size:12px;color:var(--color-text-secondary);display:block;margin-bottom:4px">ID do Drone</label>
-    <input type="text" placeholder="Ex: DRONE-NORTE-2" value="${nd.id}" oninput="STATE.newDrone.id=this.value"></div>
-    <div style="margin-bottom:8px"><label style="font-size:12px;color:var(--color-text-secondary);display:block;margin-bottom:4px">Base de Origem</label>
-    <select onchange="STATE.newDrone.base=this.value" style="width:100%">
-      ${["NORTE","SUL","LESTE","OESTE"].map(b=>`<option value="${b}" ${nd.base===b?"selected":""}>${b}</option>`).join("")}
-    </select></div>
-    <div style="margin-bottom:10px"><label style="font-size:12px;color:var(--color-text-secondary);display:block;margin-bottom:4px">Porta TCP</label>
-    <input type="number" value="${nd.port}" oninput="STATE.newDrone.port=+this.value"></div>
-    <button onclick="addDrone()" ${!nd.id.trim()?"disabled":""} style="width:100%;padding:9px;font-weight:500;background:var(--color-background-success);color:var(--color-text-success);border-color:var(--color-border-success)22;margin-bottom:12px">
-      Adicionar Drone ao Sistema
-    </button>
-    <div style="font-size:12px;font-weight:500;margin-bottom:8px;color:var(--color-text-primary)">Ações nos drones ativos</div>
-    ${STATE.drones.map(d=>`<div style="display:flex;align-items:center;justify-content:space-between;padding:6px 0;border-bottom:0.5px solid var(--color-border-tertiary)">
-      <div>
-        <div class="mono" style="font-size:11px;color:var(--color-text-primary)">${d.id.replace("DRONE-","")}</div>
-        <div style="font-size:10px;color:${c_state(d.state)}">${d.state}</div>
-      </div>
-      <div style="display:flex;gap:6px">
-        ${d.state==="PERDIDO"?`<button onclick="reviveDrone('${d.id}')" style="font-size:11px;color:var(--color-text-success)">Reconectar</button>`:""}
-        ${d.state==="LIVRE"?`<button onclick="killDrone('${d.id}')" style="font-size:11px;color:var(--color-text-danger)">Derrubar</button>`:""}
-        ${d.state!=="OCUPADO"?`<button onclick="removeDrone('${d.id}')" style="font-size:11px">Remover</button>`:""}
-        ${d.state==="OCUPADO"?`<span style="font-size:11px;color:var(--color-text-warning)">Em missao</span>`:""}
-      </div>
-    </div>`).join("")}`;
+    <p style="margin:0 0 10px;font-size:12px;color:var(--color-text-secondary)">Gerencie bases e drones. Derrubar uma base desativa todos os seus drones imediatamente.</p>
+
+    <div style="font-size:12px;font-weight:500;margin-bottom:8px;color:var(--color-text-primary)">Bases de Operação</div>
+    <div style="margin-bottom:14px">
+      ${["NORTE","SUL","LESTE","OESTE"].map(base=>{
+        const online = STATE.bases[base];
+        const drs = STATE.drones.filter(d=>d.base===base);
+        const freeN = drs.filter(d=>d.state==="LIVRE").length;
+        const occN  = drs.filter(d=>d.state==="OCUPADO").length;
+        const lostN = drs.filter(d=>d.state==="PERDIDO").length;
+        return `<div style="display:flex;align-items:center;justify-content:space-between;padding:8px 10px;border-radius:var(--border-radius-md);background:${online?"var(--color-background-primary)":"var(--color-background-danger)"};border:0.5px solid ${online?"var(--color-border-tertiary)":"var(--color-border-danger)"};margin-bottom:5px">
+          <div style="display:flex;align-items:center;gap:8px">
+            <div style="width:9px;height:9px;border-radius:50%;background:${online?"var(--color-text-success)":"var(--color-text-danger)"}"></div>
+            <div>
+              <div class="mono" style="font-size:12px;font-weight:500;color:var(--color-text-primary)">${base}</div>
+              <div style="font-size:10px;color:var(--color-text-secondary)">${online?`${freeN} livre · ${occN} ocup. · ${lostN} perd.`:"OFFLINE — todos os drones inativos"}</div>
+            </div>
+          </div>
+          <div style="display:flex;gap:5px">
+            ${online
+              ? `<button onclick="killBase('${base}')" style="font-size:11px;padding:4px 10px;color:var(--color-text-danger);border-color:var(--color-border-danger)44">✕ Derrubar Base</button>`
+              : `<button onclick="reviveBase('${base}')" style="font-size:11px;padding:4px 10px;color:var(--color-text-success);border-color:var(--color-border-success)44">↺ Restaurar Base</button>`}
+          </div>
+        </div>`;
+      }).join("")}
+    </div>
+
+    <div style="border-top:0.5px solid var(--color-border-tertiary);padding-top:12px;margin-bottom:8px">
+      <div style="font-size:12px;font-weight:500;margin-bottom:8px;color:var(--color-text-primary)">Adicionar Drone</div>
+      <div style="margin-bottom:8px"><label style="font-size:12px;color:var(--color-text-secondary);display:block;margin-bottom:4px">ID do Drone</label>
+      <input type="text" placeholder="Ex: DRONE-NORTE-2" value="${nd.id}" oninput="STATE.newDrone.id=this.value"></div>
+      <div style="margin-bottom:8px"><label style="font-size:12px;color:var(--color-text-secondary);display:block;margin-bottom:4px">Base de Origem</label>
+      <select onchange="STATE.newDrone.base=this.value" style="width:100%">
+        ${["NORTE","SUL","LESTE","OESTE"].map(b=>`<option value="${b}" ${nd.base===b?"selected":""}>${b}${!STATE.bases[b]?" (OFFLINE)":""}</option>`).join("")}
+      </select></div>
+      <div style="margin-bottom:10px"><label style="font-size:12px;color:var(--color-text-secondary);display:block;margin-bottom:4px">Porta TCP</label>
+      <input type="number" value="${nd.port}" oninput="STATE.newDrone.port=+this.value"></div>
+      <button onclick="addDrone()" ${!nd.id.trim()?"disabled":""} style="width:100%;padding:9px;font-weight:500;background:var(--color-background-success);color:var(--color-text-success);border-color:var(--color-border-success)22;margin-bottom:12px">
+        Adicionar Drone ao Sistema
+      </button>
+    </div>
+
+    <div style="font-size:12px;font-weight:500;margin-bottom:8px;color:var(--color-text-primary)">Drones ativos</div>
+    ${STATE.drones.map(d=>{
+      const baseOn = STATE.bases[d.base];
+      return `<div style="display:flex;align-items:center;justify-content:space-between;padding:6px 0;border-bottom:0.5px solid var(--color-border-tertiary)">
+        <div>
+          <div class="mono" style="font-size:11px;color:var(--color-text-primary)">${d.id.replace("DRONE-","")}</div>
+          <div style="font-size:10px;color:${c_state(d.state)}">${d.state}${!baseOn?' <span style="color:var(--color-text-danger)">(base offline)</span>':''}</div>
+        </div>
+        <div style="display:flex;gap:6px">
+          ${d.state==="PERDIDO"&&baseOn?`<button onclick="reviveDrone('${d.id}')" style="font-size:11px;color:var(--color-text-success)">Reconectar</button>`:""}
+          ${d.state==="LIVRE"&&baseOn?`<button onclick="killDrone('${d.id}')" style="font-size:11px;color:var(--color-text-danger)">Derrubar</button>`:""}
+          ${d.state!=="OCUPADO"?`<button onclick="removeDrone('${d.id}')" style="font-size:11px">Remover</button>`:""}
+          ${d.state==="OCUPADO"?`<span style="font-size:11px;color:var(--color-text-warning)">Em missao</span>`:""}
+        </div>
+      </div>`;
+    }).join("")}`;
 
   if(STATE.tab==="bridge") return `
     <p style="margin:0 0 10px;font-size:12px;color:var(--color-text-secondary)">Conecte este painel ao sistema Python real. O broker já envia eventos UDP para a porta 8000 via <span class="mono">notificar_monitor()</span>.</p>
@@ -531,9 +618,10 @@ function render() {
 
   const pendN=S.queue.filter(r=>r.status==="PENDENTE").length;
   const actN=S.queue.filter(r=>r.status==="ACEITA").length;
-  const freeN=S.drones.filter(d=>d.state==="LIVRE").length;
+  const freeN=S.drones.filter(d=>d.state==="LIVRE"&&S.bases[d.base]).length;
+  const onlineBases=Object.values(S.bases).filter(Boolean).length;
 
-  const tabs=[{k:"inject",l:"Injetar Alerta"},{k:"stress",l:"Stress Test"},{k:"drone",l:"Drones"},{k:"bridge",l:"Bridge"}];
+  const tabs=[{k:"inject",l:"Injetar Alerta"},{k:"stress",l:"Stress Test"},{k:"drone",l:"Drones & Bases"},{k:"bridge",l:"Bridge"}];
 
   document.getElementById("app").innerHTML = `
   <h2 style="sr-only">Ormuz Command Center — sistema distribuído de monitoramento marítimo</h2>
@@ -550,6 +638,7 @@ function render() {
         {l:"ACEITAS",v:S.stats.aceitas,c:"var(--color-text-info)"},
         {l:"CONCLUÍDAS",v:S.stats.concluidas,c:"var(--color-text-success)"},
         {l:"PERDIDOS",v:S.stats.perdidos,c:"var(--color-text-danger)"},
+        {l:"BASES OK",v:`${onlineBases}/4`,c:onlineBases===4?"var(--color-text-success)":onlineBases===0?"var(--color-text-danger)":"var(--color-text-warning)"},
       ].map(x=>`<div style="background:var(--color-background-secondary);border:0.5px solid var(--color-border-tertiary);border-radius:var(--border-radius-md);padding:5px 10px;text-align:center;min-width:60px">
         <div style="font-size:9px;color:var(--color-text-tertiary);margin-bottom:2px">${x.l}</div>
         <div class="mono" style="font-size:18px;font-weight:500;color:${x.c};line-height:1">${x.v}</div>
@@ -578,14 +667,14 @@ function render() {
           <span>▲ drones</span>
           <span style="color:var(--color-text-success)">verde=LIVRE</span>
           <span style="color:var(--color-text-warning)">laranja=OCUP.</span>
-          <span style="color:var(--color-text-danger)">verm.=PERD.</span>
+          <span style="color:var(--color-text-danger)">verm.=PERD./OFFLINE</span>
         </div>
       </div>
 
       <div class="card">
         <div style="font-size:13px;font-weight:500;margin-bottom:8px">
           Frota de Drones
-          <span style="font-size:11px;font-weight:400;color:var(--color-text-secondary);margin-left:6px">${freeN} livres / ${S.drones.length} total</span>
+          <span style="font-size:11px;font-weight:400;color:var(--color-text-secondary);margin-left:6px">${freeN} livres (bases online) / ${S.drones.length} total</span>
         </div>
         ${S.drones.map(renderDroneCard).join("")}
       </div>
@@ -594,7 +683,7 @@ function render() {
         <div style="font-size:13px;font-weight:500;margin-bottom:8px">Tabela de Prioridades por Setor</div>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:4px">
           ${Object.entries(PRIORITY_TABLE).map(([s,o])=>`<div style="padding:5px 8px;background:var(--color-background-primary);border:0.5px solid var(--color-border-tertiary);border-radius:var(--border-radius-md);font-size:10px">
-            <span class="mono" style="font-weight:500">${s}</span>: ${o.map((b,i)=>`<span style="color:${i===0?"var(--color-text-success)":"var(--color-text-tertiary)"}">${i>0?" > ":""}${b[0]}</span>`).join("")}
+            <span class="mono" style="font-weight:500">${s}</span>: ${o.map((b,i)=>`<span style="color:${i===0?"var(--color-text-success)":!STATE.bases[b]?"var(--color-text-danger)":"var(--color-text-tertiary)"}">${i>0?" > ":""}${b[0]}${!STATE.bases[b]?"✕":""}</span>`).join("")}
           </div>`).join("")}
         </div>
       </div>
@@ -634,11 +723,9 @@ function render() {
 
     <div style="display:flex;flex-direction:column;gap:10px">
       <div class="card">
-
         <div style="display:grid;grid-template-columns:repeat(4,1fr);margin:-12px -12px 12px;border-bottom:0.5px solid var(--color-border-tertiary)">
           ${tabs.map(t=>`<button onclick="STATE.tab='${t.k}';render()" style="padding:9px 4px;font-size:11px;font-weight:${S.tab===t.k?500:400};background:${S.tab===t.k?"var(--color-background-primary)":"transparent"};border:none;border-radius:0;border-bottom:${S.tab===t.k?"2px solid var(--color-text-info)":"2px solid transparent"};color:${S.tab===t.k?"var(--color-text-primary)":"var(--color-text-secondary)"};cursor:pointer;transition:all 0.15s">${t.l}</button>`).join("")}
         </div>
-
         ${renderTabContent()}
       </div>
     </div>
@@ -657,6 +744,9 @@ window.reviveDrone=reviveDrone;
 window.removeDrone=removeDrone;
 window.connectWs=connectWs;
 window.processQueue=processQueue;
+// ── NOVO: exportar funções de base
+window.killBase=killBase;
+window.reviveBase=reviveBase;
 
 // INIT
 log("Sistema ORMUZ COMMAND CENTER iniciado","success");
