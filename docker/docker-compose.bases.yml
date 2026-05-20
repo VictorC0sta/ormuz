@@ -1,0 +1,121 @@
+# =============================================================
+#  PC 2 — Brokers de Base (Norte, Sul, Leste, Oeste)
+#  Rodar com: docker compose -f docker-compose.bases.yml up
+# =============================================================
+
+services:
+
+  base_norte:
+    build:
+      context: ..
+      dockerfile: base/dockerfile
+    container_name: base_norte
+    restart: unless-stopped
+    ports:
+      - "${PORTA_BASE_NORTE}:${PORTA_BASE_NORTE}"
+      - "${PORTA_BASE_NORTE_UDP}:${PORTA_BASE_NORTE_UDP}/udp"
+    environment:
+      BASE_ID: "NORTE"
+      MINHA_PORTA: "${PORTA_BASE_NORTE}"
+      MINHA_PORTA_UDP: "${PORTA_BASE_NORTE_UDP}"
+      # Endereços das outras bases para broadcast de ACEITE
+      IP_BASE_SUL: "base_sul"
+      IP_BASE_LESTE: "base_leste"
+      IP_BASE_OESTE: "base_oeste"
+      PORTA_BASE_SUL: "${PORTA_BASE_SUL}"
+      PORTA_BASE_LESTE: "${PORTA_BASE_LESTE}"
+      PORTA_BASE_OESTE: "${PORTA_BASE_OESTE}"
+      # Endereço dos drones (PC 3)
+      IP_PC_DRONES: "${IP_PC_DRONES}"
+      # Parâmetros de timeout e heartbeat
+      TIMEOUT_BASE_2: "${TIMEOUT_BASE_2}"
+      TIMEOUT_BASE_3: "${TIMEOUT_BASE_3}"
+      TIMEOUT_BASE_4: "${TIMEOUT_BASE_4}"
+      HEARTBEAT_TIMEOUT: "${HEARTBEAT_TIMEOUT}"
+    networks:
+      - ormuz_net
+
+  base_sul:
+    build:
+      context: ..
+      dockerfile: base/dockerfile
+    container_name: base_sul
+    restart: unless-stopped
+    ports:
+      - "${PORTA_BASE_SUL}:${PORTA_BASE_SUL}"
+      - "${PORTA_BASE_SUL_UDP}:${PORTA_BASE_SUL_UDP}/udp"
+    environment:
+      BASE_ID: "SUL"
+      MINHA_PORTA: "${PORTA_BASE_SUL}"
+      MINHA_PORTA_UDP: "${PORTA_BASE_SUL_UDP}"
+      IP_BASE_NORTE: "base_norte"
+      IP_BASE_LESTE: "base_leste"
+      IP_BASE_OESTE: "base_oeste"
+      PORTA_BASE_NORTE: "${PORTA_BASE_NORTE}"
+      PORTA_BASE_LESTE: "${PORTA_BASE_LESTE}"
+      PORTA_BASE_OESTE: "${PORTA_BASE_OESTE}"
+      IP_PC_DRONES: "${IP_PC_DRONES}"
+      TIMEOUT_BASE_2: "${TIMEOUT_BASE_2}"
+      TIMEOUT_BASE_3: "${TIMEOUT_BASE_3}"
+      TIMEOUT_BASE_4: "${TIMEOUT_BASE_4}"
+      HEARTBEAT_TIMEOUT: "${HEARTBEAT_TIMEOUT}"
+    networks:
+      - ormuz_net
+
+  base_leste:
+    build:
+      context: ..
+      dockerfile: base/dockerfile
+    container_name: base_leste
+    restart: unless-stopped
+    ports:
+      - "${PORTA_BASE_LESTE}:${PORTA_BASE_LESTE}"
+      - "${PORTA_BASE_LESTE_UDP}:${PORTA_BASE_LESTE_UDP}/udp"
+    environment:
+      BASE_ID: "LESTE"
+      MINHA_PORTA: "${PORTA_BASE_LESTE}"
+      MINHA_PORTA_UDP: "${PORTA_BASE_LESTE_UDP}"
+      IP_BASE_NORTE: "base_norte"
+      IP_BASE_SUL: "base_sul"
+      IP_BASE_OESTE: "base_oeste"
+      PORTA_BASE_NORTE: "${PORTA_BASE_NORTE}"
+      PORTA_BASE_SUL: "${PORTA_BASE_SUL}"
+      PORTA_BASE_OESTE: "${PORTA_BASE_OESTE}"
+      IP_PC_DRONES: "${IP_PC_DRONES}"
+      TIMEOUT_BASE_2: "${TIMEOUT_BASE_2}"
+      TIMEOUT_BASE_3: "${TIMEOUT_BASE_3}"
+      TIMEOUT_BASE_4: "${TIMEOUT_BASE_4}"
+      HEARTBEAT_TIMEOUT: "${HEARTBEAT_TIMEOUT}"
+    networks:
+      - ormuz_net
+
+  base_oeste:
+    build:
+      context: ..
+      dockerfile: base/dockerfile
+    container_name: base_oeste
+    restart: unless-stopped
+    ports:
+      - "${PORTA_BASE_OESTE}:${PORTA_BASE_OESTE}"
+      - "${PORTA_BASE_OESTE_UDP}:${PORTA_BASE_OESTE_UDP}/udp"
+    environment:
+      BASE_ID: "OESTE"
+      MINHA_PORTA: "${PORTA_BASE_OESTE}"
+      MINHA_PORTA_UDP: "${PORTA_BASE_OESTE_UDP}"
+      IP_BASE_NORTE: "base_norte"
+      IP_BASE_SUL: "base_sul"
+      IP_BASE_LESTE: "base_leste"
+      PORTA_BASE_NORTE: "${PORTA_BASE_NORTE}"
+      PORTA_BASE_SUL: "${PORTA_BASE_SUL}"
+      PORTA_BASE_LESTE: "${PORTA_BASE_LESTE}"
+      IP_PC_DRONES: "${IP_PC_DRONES}"
+      TIMEOUT_BASE_2: "${TIMEOUT_BASE_2}"
+      TIMEOUT_BASE_3: "${TIMEOUT_BASE_3}"
+      TIMEOUT_BASE_4: "${TIMEOUT_BASE_4}"
+      HEARTBEAT_TIMEOUT: "${HEARTBEAT_TIMEOUT}"
+    networks:
+      - ormuz_net
+
+networks:
+  ormuz_net:
+    driver: bridge
