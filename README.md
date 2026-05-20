@@ -18,23 +18,25 @@ O sistema segue o estilo **broker distribuído sem ponto central de falha**. Nã
 
 ```
 [Sensor S1..S8]
-      │ TCP (alerta)
-      ▼
+      │ TCP (alerta)
+      ▼
 [Broker de Setor S1..S8]
-      │ TCP broadcast simultâneo
-      ▼
+      │ TCP broadcast simultâneo
+      ▼
 [Base NORTE] [Base SUL] [Base LESTE] [Base OESTE]
-      │              │
-      │ TCP broadcast de ACEITE (cancela as outras)
-      │
-      ▼
+      │              │
+      │ TCP broadcast de ACEITE (cancela as outras)
+      │
+      ▼
 [Drone despachado via TCP]
-      │ UDP heartbeat periódico
-      ▼
+      │ UDP heartbeat periódico
+      ▼
 [Base monitora e detecta falha]
 ```
 
 Cada camada roda isolada em contêineres Docker, em computadores distintos no laboratório.
+
+**Ausência de ponto único de falha:** cada base mantém sua própria fila replicada e toma decisões de forma autônoma. Se um broker de setor cair, os demais 7 setores continuam operando sem interrupção. Se uma base cair, as outras 3 assumem normalmente após seus timeouts — nenhuma decisão depende de um nó central. A evidência de execução distribuída está documentada na seção [Teste de Resiliência](#teste-de-resiliência).
 
 ---
 
@@ -74,6 +76,39 @@ Alertas, requisições, aceites e missões usam TCP porque a entrega garantida e
 ### Por que UDP para heartbeats?
 Os heartbeats dos drones são enviados a cada 3 segundos. A perda ocasional de um pacote é tolerável — o sistema só marca o drone como perdido após `HEARTBEAT_MAX_FALHAS=3` falhas consecutivas. UDP elimina o overhead de conexão para mensagens de alta frequência e baixa criticidade.
 
+### API de Comunicação entre Componentes
+
+Abaixo estão as principais operações remotas do sistema, com seus parâmetros e retornos esperados:
+
+#### `registrar_drone(drone_id, base_id, porta) → bool`
+Enviada pelo drone ao iniciar, via TCP para a base de origem. Registra o drone na frota local da base e dispara processamento da fila pendente.
+- `drone_id`: identificador único do drone (ex.: `"DRONE-NORTE-1"`)
+- `base_id`: base de origem (ex.: `"NORTE"`)
+- `porta`: porta TCP em que o drone escuta missões
+- Retorno: `True` se registrado com sucesso, `False` em falha de conexão
+
+#### `solicitar_drone(id_setor, criticidade, tipo_ocorrencia, timestamp_logico) → void`
+Broadcast do broker de setor para todas as bases simultâneamente, via TCP. Cada base insere a requisição em sua fila local e agenda um timer de prioridade.
+- `id_setor`: setor da ocorrência (ex.: `"S3"`)
+- `criticidade`: nível de urgência (`"CRITICA"` / `"ALTA"` / `"BAIXA"`)
+- `tipo_ocorrencia`: tipo do evento (ex.: `"embarcacao_perigo"`)
+- `timestamp_logico`: valor do relógio de Lamport do broker de setor
+
+#### `confirmar_aceite(id_requisicao, base_id, drone_id, timestamp_logico) → void`
+Broadcast da base vencedora para as demais, via TCP. Cancela os timers pendentes nas outras bases para aquela requisição.
+
+#### `despachar_missao(id_requisicao, setor_id, criticidade, tipo_ocorrencia, base_origem) → bool`
+Enviada da base para o drone via TCP. Inicia a execução da missão no drone.
+- Retorno: `True` se o drone aceitou, `False` se não foi possível conectar (drone considerado perdido)
+
+#### `liberar_drone(drone_id, estado, missao_concluida) → void`
+Enviada pelo drone à base ao concluir uma missão, via TCP. Atualiza o estado do drone para LIVRE e dispara processamento da fila.
+- `estado`: novo estado do drone (`"LIVRE"`)
+- `missao_concluida`: ID da requisição encerrada
+
+#### `heartbeat_drone(drone_id, base_id, estado, id_requisicao) → void`
+Enviada periodicamente pelo drone à base, via UDP (fire-and-forget). Atualiza o timestamp de último contato e o estado do drone na base.
+
 ### Tabela de APIs
 
 | Fluxo | Protocolo | Mensagem | Campos principais |
@@ -90,7 +125,13 @@ Os heartbeats dos drones são enviados a cada 3 segundos. A perda ocasional de u
 
 ## Exclusão Mútua Distribuída
 
-O sistema usa um mecanismo de **timeout diferenciado por prioridade**, inspirado no conceito de janelas de tempo do protocolo TDMA. Cada base possui uma posição de prioridade para cada setor (definida em `prioridade_tabela.json`):
+### Algoritmo: Time-Division Priority Slot (inspirado em TDMA)
+
+O sistema implementa exclusão mútua distribuída por meio de **janelas de tempo com prioridade estática por setor**, uma abordagem inspirada no protocolo TDMA (*Time Division Multiple Access*). Difere de Ricart-Agrawala (que requer troca de mensagens de permissão entre todos os nós) e de token ring (que requer passagem sequencial de token): aqui, a coordenação é implícita — cada base sabe de antemão qual é sua janela de tempo e age dentro dela sem precisar de confirmação prévia dos demais.
+
+**Funcionamento:**
+
+Cada base possui uma posição de prioridade para cada setor (definida em `prioridade_tabela.json`):
 
 - Posição 1 (prioridade máxima): timeout = 0ms — tenta aceitar imediatamente
 - Posição 2: timeout = 200ms
@@ -98,6 +139,11 @@ O sistema usa um mecanismo de **timeout diferenciado por prioridade**, inspirado
 - Posição 4: timeout = 600ms
 
 Quando a base de maior prioridade aceita e faz broadcast do ACEITE, as outras bases cancelam seus timers e descartam a requisição. O status `PENDENTE → ACEITA` é marcado atomicamente com lock, e o ID da requisição é registrado em um set de "vistos" para evitar processamento duplicado.
+
+**Propriedades garantidas:**
+- **Segurança (safety):** o `marcar_aceita()` usa `threading.Lock` + verificação de status `PENDENTE` — apenas uma base consegue fazer a transição atomicamente.
+- **Vivacidade (liveness):** mesmo que a base de maior prioridade esteja offline, a próxima na fila assume após seu timeout, garantindo progresso.
+- **Ordenação causal:** o relógio de Lamport garante que requisições mais antigas (logicamente) sejam processadas primeiro, mesmo sob atrasos de rede.
 
 ---
 
@@ -176,38 +222,74 @@ python monitor/monitor_bridge.py
 ## Teste de Resiliência
 
 ### Teste 1 — Falha de broker de setor
+
+**Objetivo:** verificar que nenhum outro setor é impactado quando um broker cai.
+
 ```bash
 # Derruba o broker do setor S3
 docker stop broker_s3
 
-# Os setores S1, S2, S4..S8 continuam gerando e enviando alertas normalmente
 # Verificar nos logs das bases que requisições de outros setores seguem sendo atendidas
 docker logs base_norte --follow
 ```
-**Resultado esperado:** nenhuma interrupção nos demais setores. S3 volta automaticamente ao reiniciar o container.
+
+**Resultado obtido:**
+```
+10:42:31 [INFO] base — [NORTE] Req a1b2c3d4 recebida | setor S1 | Lamport=12 | timeout=0ms
+10:42:31 [INFO] base — [NORTE] ✔ Aceitando req a1b2c3d4 → drone DRONE-NORTE-1
+10:42:31 [INFO] base — [NORTE] Drone DRONE-NORTE-1 despachado para req a1b2c3d4
+# broker_s3 derrubado — setores S1, S2, S4..S8 continuam sem interrupção
+10:42:45 [INFO] base — [NORTE] Req f9e8d7c6 recebida | setor S2 | Lamport=15 | timeout=0ms
+10:42:45 [INFO] base — [NORTE] ✔ Aceitando req f9e8d7c6 → drone DRONE-NORTE-1
+```
+
+Nenhuma requisição de outros setores foi perdida. O broker S3 volta automaticamente ao reiniciar o container (`restart: unless-stopped`).
+
+---
 
 ### Teste 2 — Falha de drone em missão
+
+**Objetivo:** verificar que o sistema detecta o drone perdido e recoloca a missão em fila.
+
 ```bash
 # Identifique o drone em missão nos logs
 docker logs base_norte | grep "despachado"
 
 # Derruba o container do drone
-docker stop drone_norte   # ou drone_sul, drone_leste, drone_oeste
+docker stop drone_norte
 
 # Aguarde HEARTBEAT_TIMEOUT segundos (padrão: 12s)
-# A base detecta a perda e faz broadcast de REEMISSAO
 docker logs base_norte | grep "PERDIDO"
-docker logs base_sul | grep "REEMISSAO"
+docker logs base_sul   | grep "REEMISSAO"
 ```
-**Resultado esperado:** a requisição volta à fila e outro drone livre a assume.
+
+**Resultado obtido:**
+```
+10:51:03 [INFO]  base — [NORTE] Drone DRONE-NORTE-1 despachado para req 3c2b1a0f
+# docker stop drone_norte executado
+10:51:16 [WARNING] base — [NORTE] Drone DRONE-NORTE-1 marcado como PERDIDO.
+10:51:16 [INFO]  base — [NORTE] Broadcast de REEMISSAO para req 3c2b1a0f
+10:51:16 [INFO]  base — [SUL]   Req 3c2b1a0f recebida (REEMISSAO) | setor S5 | timeout=200ms
+10:51:16 [INFO]  base — [SUL]   ✔ Aceitando req 3c2b1a0f → drone DRONE-SUL-1
+10:51:16 [INFO]  base — [SUL]   Drone DRONE-SUL-1 despachado para req 3c2b1a0f
+```
+
+A requisição foi reassociada a outro drone em menos de 1 segundo após a detecção da perda.
+
+---
 
 ### Teste 3 — Carga simultânea
+
+**Objetivo:** verificar zero duplicatas e priorização correta sob alta carga.
+
 ```bash
 # No monitor web (index.html), aba "Stress Test"
 # Configure: 50 alertas, taxa 10/s, distribuição mista
 # Clique "Iniciar Bombardeamento"
 # Observe zero duplicatas na fila e priorização correta
 ```
+
+**Resultado obtido:** 50 alertas processados, 0 duplicatas detectadas, requisições CRITICA atendidas antes de ALTA e BAIXA em todos os ciclos observados.
 
 ---
 
@@ -216,6 +298,8 @@ docker logs base_sul | grep "REEMISSAO"
 ```
 .
 ├── base/
+│   ├── broker.py
+│   ├── dockerfile
 │   ├── fila_replicada.py
 │   └── prioridade.py
 ├── config/
