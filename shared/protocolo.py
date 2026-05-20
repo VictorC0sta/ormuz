@@ -1,3 +1,10 @@
+"""
+protocolo.py — Camada de rede (Ormuz Command Center).
+
+Implementa comunicação TCP (garantida) usando framing length-prefix (4 bytes),
+e UDP (telemetria/heartbeats) em modo fire-and-forget.
+"""
+
 import socket
 import struct
 import json
@@ -10,10 +17,13 @@ logger = logging.getLogger(__name__)
 
 # ── Constantes de rede ───────────────────────────────────────────────────────
 BUFFER_UDP  = 4096
-TIMEOUT_TCP = 2.0   # Reduzido de 5s para 2s: broadcast não pode travar o sistema
+TIMEOUT_TCP = 2.0  # Timeout curto para evitar bloqueios no broadcast
 
+
+# ── TCP — Envio ──────────────────────────────────────────────────────────────
 
 def tcp_enviar(host: str, porta: int, payload: dict) -> bool:
+    """Envia payload JSON via TCP prefixado com seu tamanho (4 bytes)."""
     try:
         dados = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         header = struct.pack(">I", len(dados))
@@ -30,6 +40,7 @@ def tcp_enviar(host: str, porta: int, payload: dict) -> bool:
 
 
 def tcp_broadcast(destinos: list[tuple[str, int]], payload: dict) -> dict[str, bool]:
+    """Envia payload em paralelo para vários destinos TCP."""
     resultados: dict[str, bool] = {}
 
     with ThreadPoolExecutor(max_workers=len(destinos), thread_name_prefix="broadcast") as pool:
@@ -45,7 +56,7 @@ def tcp_broadcast(destinos: list[tuple[str, int]], payload: dict) -> dict[str, b
                 logger.warning("[TCP broadcast] Exceção para %s: %s", chave, e)
                 resultados[chave] = False
 
-    # Garante que destinos que não responderam no timeout também entrem como False
+    # Preenche como False os destinos que não responderam a tempo
     for host, porta in destinos:
         chave = f"{host}:{porta}"
         if chave not in resultados:
@@ -57,13 +68,13 @@ def tcp_broadcast(destinos: list[tuple[str, int]], payload: dict) -> dict[str, b
 # ── TCP — Recebimento ────────────────────────────────────────────────────────
 
 def tcp_receber_completo(conn: socket.socket) -> Optional[dict]:
+    """Lê prefixo de 4 bytes e retorna o payload JSON desserializado."""
     try:
         header = _receber_exato(conn, 4)
         if not header:
             return None
 
         tamanho = struct.unpack(">I", header)[0]
-
         dados = _receber_exato(conn, tamanho)
         if not dados:
             return None
@@ -76,6 +87,7 @@ def tcp_receber_completo(conn: socket.socket) -> Optional[dict]:
 
 
 def _receber_exato(conn: socket.socket, n: int) -> Optional[bytes]:
+    """Lê exatamente n bytes do socket."""
     buffer = b""
     while len(buffer) < n:
         chunk = conn.recv(n - len(buffer))
@@ -85,9 +97,10 @@ def _receber_exato(conn: socket.socket, n: int) -> Optional[bytes]:
     return buffer
 
 
-# ── TCP — Servidor simples ───────────────────────────────────────────────────
+# ── TCP — Servidor ───────────────────────────────────────────────────────────
 
 def criar_servidor_tcp(porta: int, backlog: int = 10) -> socket.socket:
+    """Cria e retorna um socket TCP passivo configurado para reuso imediato."""
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind(("0.0.0.0", porta))
@@ -99,6 +112,7 @@ def criar_servidor_tcp(porta: int, backlog: int = 10) -> socket.socket:
 # ── UDP — Envio ──────────────────────────────────────────────────────────────
 
 def udp_enviar(host: str, porta: int, payload: dict) -> bool:
+    """Envia payload JSON em um único datagrama UDP."""
     try:
         dados = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
@@ -109,9 +123,10 @@ def udp_enviar(host: str, porta: int, payload: dict) -> bool:
         return False
 
 
-# ── UDP — Servidor simples ────────────────────────────────────────────────────
+# ── UDP — Servidor ────────────────────────────────────────────────────────────
 
 def criar_servidor_udp(porta: int) -> socket.socket:
+    """Cria e retorna um socket UDP passivo configurado para reuso imediato."""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind(("0.0.0.0", porta))
@@ -119,8 +134,10 @@ def criar_servidor_udp(porta: int) -> socket.socket:
     return s
 
 
-def notificar_monitor(evento: dict):
-    """Envia um evento para a interface gráfica via UDP. Falha silenciosa se o monitor não estiver ativo."""
+# ── Monitor ───────────────────────────────────────────────────────────────────
+
+def notificar_monitor(evento: dict) -> None:
+    """Envia evento ao painel web via UDP ignorando silenciosamente as falhas."""
     ip_monitor = os.environ.get("IP_MONITOR", "127.0.0.1")
     porta_monitor = 8000
     try:
@@ -128,4 +145,4 @@ def notificar_monitor(evento: dict):
         sock.sendto(json.dumps(evento).encode("utf-8"), (ip_monitor, porta_monitor))
         sock.close()
     except Exception:
-        pass
+        pass  # Evita que o sistema trave caso o monitor esteja offline
