@@ -1,0 +1,10 @@
+{
+  "S1": ["NORTE", "OESTE", "LESTE", "SUL"],
+  "S2": ["SUL", "LESTE", "OESTE", "NORTE"],
+  "S3": ["LESTE", "NORTE", "SUL", "OESTE"],
+  "S4": ["OESTE", "NORTE", "SUL", "LESTE"],
+  "S5": ["NORTE", "LESTE", "SUL", "OESTE"],
+  "S6": ["LESTE", "NORTE", "SUL", "OESTE"],
+  "S7": ["NORTE", "SUL", "LESTE", "OESTE"],
+  "S8": ["LESTE", "SUL", "NORTE", "OESTE"]
+}

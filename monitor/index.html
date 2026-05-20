@@ -1,0 +1,671 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ormuz Command Center</title>
+    <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; background-color: #1e1e1e; color: #e0e0e0; }
+    
+    /* Variáveis de cor para garantir que o painel fique bonito no tema escuro */
+    :root {
+      --color-background-primary: #121212;
+      --color-background-secondary: #1e1e1e;
+      --color-background-success: #1b3320;
+      --color-background-warning: #332711;
+      --color-background-danger: #331414;
+      --color-background-info: #11263d;
+      
+      --color-border-primary: #555;
+      --color-border-secondary: #333;
+      --color-border-tertiary: #222;
+      --color-border-success: #2ea043;
+      --color-border-warning: #d29922;
+      --color-border-danger: #f85149;
+      --color-border-info: #388bfd;
+      
+      --color-text-primary: #e6edf3;
+      --color-text-secondary: #8b949e;
+      --color-text-tertiary: #6e7681;
+      --color-text-success: #3fb950;
+      --color-text-warning: #d29922;
+      --color-text-danger: #f85149;
+      --color-text-info: #58a6ff;
+      
+      --border-radius-md: 4px;
+      --border-radius-lg: 8px;
+      --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+    }
+
+    select, input[type=text], input[type=number] {
+      width: 100%; padding: 6px 10px; font-size: 12px;
+      background: var(--color-background-primary);
+      color: var(--color-text-primary);
+      border: 0.5px solid var(--color-border-secondary);
+      border-radius: var(--border-radius-md);
+      font-family: var(--font-sans);
+      margin: 0;
+    }
+    select:focus, input:focus { outline: none; border-color: var(--color-border-primary); }
+    button {
+      background: transparent; border: 0.5px solid var(--color-border-secondary);
+      color: var(--color-text-secondary); border-radius: var(--border-radius-md);
+      cursor: pointer; font-family: var(--font-sans); font-size: 12px;
+      padding: 7px 12px; transition: background 0.15s, color 0.15s;
+    }
+    button:hover { background: var(--color-background-secondary); color: var(--color-text-primary); }
+    button:disabled { opacity: 0.45; cursor: default; }
+    input[type=range] { width: 100%; accent-color: var(--color-text-info); }
+    input[type=checkbox] { accent-color: var(--color-text-info); cursor: pointer; }
+    .card { background: var(--color-background-secondary); border: 0.5px solid var(--color-border-tertiary); border-radius: var(--border-radius-lg); padding: 12px; }
+    .mono { font-family: var(--font-mono); }
+    .badge { font-size: 10px; padding: 2px 7px; border-radius: var(--border-radius-md); font-family: var(--font-mono); font-weight: 500; border: 0.5px solid; }
+    .scroll { overflow-y: auto; scrollbar-width: thin; }
+    pre { margin: 0; white-space: pre-wrap; font-family: var(--font-mono); font-size: 10px; color: var(--color-text-secondary); line-height: 1.6; }
+    </style>
+</head>
+<body>
+
+<div id="app" style="font-family:var(--font-sans);padding:1rem"></div>
+
+<script>
+(function() {
+const PRIORITY_TABLE = {
+  S1:["NORTE","OESTE","LESTE","SUL"], S2:["SUL","LESTE","OESTE","NORTE"],
+  S3:["LESTE","NORTE","SUL","OESTE"], S4:["OESTE","NORTE","SUL","LESTE"],
+  S5:["NORTE","LESTE","SUL","OESTE"], S6:["LESTE","NORTE","SUL","OESTE"],
+  S7:["NORTE","SUL","LESTE","OESTE"], S8:["LESTE","SUL","NORTE","OESTE"]
+};
+const CRIT_PESO = {CRITICA:3, ALTA:2, BAIXA:1};
+const TIPO_CRIT = {
+  embarcacao_perigo:"CRITICA", bloqueio_rota:"ALTA",
+  objeto_nao_identificado:"ALTA", embarcacao_deriva:"BAIXA",
+  falha_sinalizacao:"BAIXA", anomalia_menor:"BAIXA"
+};
+const TIPOS = Object.keys(TIPO_CRIT);
+const TIMEOUT_MS = {1:0,2:200,3:400,4:600};
+const SECTOR_LAYOUT = [
+  {id:"S1",col:0,row:0},{id:"S2",col:1,row:0},{id:"S5",col:2,row:0},{id:"S6",col:3,row:0},
+  {id:"S3",col:0,row:1},{id:"S4",col:1,row:1},{id:"S7",col:2,row:1},{id:"S8",col:3,row:1}
+];
+
+let _uid=0;
+const uid = () => `R${++_uid}`;
+let lamportClock = 0;
+const incLamport = () => ++lamportClock;
+
+let STATE = {
+  drones: [
+    {id:"DRONE-NORTE-1",base:"NORTE",state:"LIVRE",mission:null,port:7001},
+    {id:"DRONE-SUL-1",base:"SUL",state:"LIVRE",mission:null,port:7011},
+    {id:"DRONE-LESTE-1",base:"LESTE",state:"LIVRE",mission:null,port:7021},
+    {id:"DRONE-OESTE-1",base:"OESTE",state:"LIVRE",mission:null,port:7031}
+  ],
+  queue: [],
+  events: [],
+  lamport: 0,
+  tab: "inject",
+  stats: {total:0,aceitas:0,concluidas:0,perdidos:0},
+  bombarding: false, bombSent:0, bombTotal:0,
+  bombCfg: {count:20,rate:3,sectors:"all",criticidade:"mixed"},
+  newDrone: {id:"",base:"NORTE",port:7100},
+  injectForm: {sector:"S1",tipo:"embarcacao_perigo"},
+  autoSim: true,
+  wsUrl: "ws://localhost:8001",
+  wsStatus: "sim",
+  wsObj: null
+};
+
+let bombTimer = null;
+let autoSimTimer = null;
+
+function sortByPriority(q) {
+  return [...q].sort((a,b) => {
+    const pa=CRIT_PESO[a.crit]||1, pb=CRIT_PESO[b.crit]||1;
+    if(pb!==pa) return pb-pa;
+    if(a.ts!==b.ts) return a.ts-b.ts;
+    return a.sector.localeCompare(b.sector);
+  });
+}
+
+function log(msg, level="info") {
+  const ts = new Date().toLocaleTimeString("pt-BR",{hour12:false});
+  STATE.events.unshift({id:uid(),ts,msg,level});
+  if(STATE.events.length>150) STATE.events.length=150;
+}
+
+function processQueue() {
+  const pending = STATE.queue.filter(r=>r.status==="PENDENTE");
+  if(!pending.length) return;
+  const sorted = sortByPriority(pending);
+  const free = STATE.drones.find(d=>d.state==="LIVRE");
+  if(!free) return;
+  const req = sorted[0];
+  const ts = lamportClock;
+  req.status="ACEITA"; req.drone=free.id;
+  free.state="OCUPADO"; free.mission=req.id;
+  log(`[${free.base}] Aceitou ${req.id} -> ${free.id.split("-").slice(1).join("-")} | L=${ts}`,"success");
+  STATE.stats.aceitas++;
+  const dur = 8000+Math.random()*12000;
+  setTimeout(()=>{
+    free.state="LIVRE"; free.mission=null;
+    req.status="CONCLUIDA";
+    log(`Missao ${req.id} concluida por ${free.id.split("-").slice(1).join("-")}`,"success");
+    STATE.stats.concluidas++;
+    setTimeout(processQueue,100);
+    render();
+  }, dur);
+}
+
+function injectAlert(sector, tipo, crit) {
+  const ts = incLamport();
+  const id = uid();
+  const req = {id,sector,tipo,crit,ts,status:"PENDENTE",drone:null};
+  const lvl = crit==="CRITICA"?"critica":crit==="ALTA"?"alta":"info";
+  log(`ALERTA ${sector} | ${tipo.replace(/_/g," ")} [${crit}] | L=${ts}`,lvl);
+  STATE.stats.total++;
+  STATE.queue.push(req);
+  STATE.queue = sortByPriority(STATE.queue);
+  STATE.lamport = lamportClock;
+  const order = PRIORITY_TABLE[sector]||["NORTE","SUL","LESTE","OESTE"];
+  const pos = (order.indexOf("NORTE")+1)||4;
+  const tmo = TIMEOUT_MS[pos]??600;
+  setTimeout(()=>{ processQueue(); render(); }, tmo+50);
+  render();
+}
+
+function startBombard() {
+  STATE.bombarding=true; STATE.bombSent=0; STATE.bombTotal=STATE.bombCfg.count;
+  log(`BOMBARDEAMENTO: ${STATE.bombCfg.count} alertas @ ${STATE.bombCfg.rate}/s`,"warn");
+  let sent=0; const total=STATE.bombCfg.count;
+  const interval=Math.max(50,1000/STATE.bombCfg.rate);
+  const fire=()=>{
+    if(sent>=total){STATE.bombarding=false;log(`Bombardeamento concluido: ${total} alertas`,"info");render();return;}
+    const sAll=["S1","S2","S3","S4","S5","S6","S7","S8"];
+    const s=STATE.bombCfg.sectors==="all"?sAll[Math.floor(Math.random()*8)]:STATE.bombCfg.sectors;
+    let c; const r=Math.random();
+    if(STATE.bombCfg.criticidade==="mixed") c=r<0.2?"CRITICA":r<0.5?"ALTA":"BAIXA";
+    else c=STATE.bombCfg.criticidade;
+    const t=TIPOS[Math.floor(Math.random()*TIPOS.length)];
+    injectAlert(s,t,c);
+    sent++; STATE.bombSent=sent;
+    bombTimer=setTimeout(fire,interval);
+    render();
+  };
+  fire();
+}
+
+function stopBombard() {
+  if(bombTimer) clearTimeout(bombTimer);
+  STATE.bombarding=false;
+  log("Bombardeamento interrompido","warn");
+  render();
+}
+
+function addDrone() {
+  const nd=STATE.newDrone;
+  if(!nd.id.trim()) return;
+  STATE.drones.push({id:nd.id.trim(),base:nd.base,state:"LIVRE",mission:null,port:nd.port});
+  log(`Drone ${nd.id} adicionado a base ${nd.base}`,"success");
+  STATE.newDrone={id:"",base:nd.base,port:nd.port+10};
+  setTimeout(()=>{processQueue();render();},200);
+  render();
+}
+
+function killDrone(droneId) {
+  const d=STATE.drones.find(x=>x.id===droneId);
+  if(!d) return;
+  d.state="PERDIDO";
+  log(`Drone ${droneId.split("-").slice(1).join("-")} marcado PERDIDO`,"warn");
+  STATE.stats.perdidos++;
+  if(d.mission){
+    const req=STATE.queue.find(r=>r.id===d.mission);
+    if(req){req.status="PENDENTE";req.drone=null;}
+    log(`Missao ${d.mission} devolvida a fila`,"info");
+    d.mission=null;
+    setTimeout(()=>{processQueue();render();},300);
+  }
+  render();
+}
+
+function reviveDrone(droneId) {
+  const d=STATE.drones.find(x=>x.id===droneId);
+  if(d){d.state="LIVRE";d.mission=null;}
+  log(`Drone ${droneId.split("-").slice(1).join("-")} reconectado`,"success");
+  setTimeout(()=>{processQueue();render();},200);
+  render();
+}
+
+function removeDrone(droneId) {
+  STATE.drones=STATE.drones.filter(d=>d.id!==droneId);
+  log(`Drone ${droneId.split("-").slice(1).join("-")} removido`,"warn");
+  render();
+}
+
+function connectWs() {
+  try {
+    const ws=new WebSocket(STATE.wsUrl);
+    ws.onopen=()=>{STATE.wsStatus="connected";log(`Conectado: ${STATE.wsUrl}`,"success");render();};
+    ws.onmessage=(e)=>{
+      try{
+        const m=JSON.parse(e.data);
+        if(m.tipo==="DRONE_DESPACHADO") log(`[${m.base}] ${m.drone} -> Setor ${m.setor}`,"success");
+        else if(m.tipo==="MISSAO_CONCLUIDA") log(`Missao concluida: drone ${m.drone}`,"success");
+        else if(m.tipo==="ALERTA_GERADO") injectAlert(m.setor,"anomalia_menor",m.criticidade);
+        render();
+      }catch(e2){}
+    };
+    ws.onerror=()=>{STATE.wsStatus="error";render();};
+    ws.onclose=()=>{STATE.wsStatus="sim";log("Desconectado do sistema real","warn");render();};
+    STATE.wsObj=ws;
+    render();
+  }catch(e){STATE.wsStatus="error";log("Falha: "+e.message,"warn");render();}
+}
+
+function startAutoSim() {
+  if(autoSimTimer) clearInterval(autoSimTimer);
+  autoSimTimer=setInterval(()=>{
+    if(!STATE.autoSim) return;
+    if(Math.random()<0.4){
+      const s=`S${Math.floor(Math.random()*8)+1}`;
+      const t=TIPOS[Math.floor(Math.random()*TIPOS.length)];
+      injectAlert(s,t,TIPO_CRIT[t]);
+    }
+  },4500);
+}
+
+// ─── RENDER ───────────────────────────────────────────────────────────────────
+function c_crit(c){return{CRITICA:"var(--color-text-danger)",ALTA:"var(--color-text-warning)",BAIXA:"var(--color-text-info)"}[c]||"var(--color-text-secondary)"}
+function bg_crit(c){return{CRITICA:"var(--color-background-danger)",ALTA:"var(--color-background-warning)",BAIXA:"var(--color-background-info)"}[c]||"var(--color-background-secondary)"}
+function c_state(s){return{LIVRE:"var(--color-text-success)",OCUPADO:"var(--color-text-warning)",PERDIDO:"var(--color-text-danger)"}[s]||"var(--color-text-secondary)"}
+function bg_state(s){return{LIVRE:"var(--color-background-success)",OCUPADO:"var(--color-background-warning)",PERDIDO:"var(--color-background-danger)"}[s]||"var(--color-background-secondary)"}
+function c_log(l){return{success:"var(--color-text-success)",warn:"var(--color-text-warning)",critica:"var(--color-text-danger)",alta:"var(--color-text-warning)",info:"var(--color-text-secondary)"}[l]||"var(--color-text-secondary)"}
+
+function renderMap() {
+  const sW=64,sH=54,mX=8,mY=26,gX=4,gY=4;
+  const totalW=mX*2+4*sW+3*gX;
+  const totalH=mY*2+2*sH+gY;
+
+  const pendByS={},actByS={};
+  STATE.queue.forEach(r=>{
+    if(r.status==="PENDENTE") pendByS[r.sector]=(pendByS[r.sector]||0)+1;
+    if(r.status==="ACEITA") actByS[r.sector]=r.crit;
+  });
+
+  let sectors="",dronePts="";
+  SECTOR_LAYOUT.forEach(({id,col,row})=>{
+    const x=mX+col*(sW+gX), y=mY+row*(sH+gY);
+    const p=pendByS[id]||0, a=actByS[id];
+    const fl=p>0?(p>2?"danger":"warning"):a?"info":"none";
+    const fillMap={danger:"rgba(209,55,55,0.18)",warning:"rgba(186,117,23,0.15)",info:"rgba(24,95,165,0.12)",none:"var(--color-background-primary)"};
+    const strMap={danger:"var(--color-border-danger)",warning:"var(--color-border-warning)",info:"var(--color-border-info)",none:"var(--color-border-secondary)"};
+    const prio=(PRIORITY_TABLE[id]||[]).map(b=>b[0]).join(">");
+    sectors+=`<g>
+      <rect x="${x}" y="${y}" width="${sW}" height="${sH}" rx="5" fill="${fillMap[fl]}" stroke="${strMap[fl]}" stroke-width="0.5"/>
+      <text x="${x+sW/2}" y="${y+18}" text-anchor="middle" style="font-size:12px;font-weight:500;font-family:var(--font-mono)" fill="var(--color-text-primary)">${id}</text>
+      <text x="${x+sW/2}" y="${y+31}" text-anchor="middle" style="font-size:8px;font-family:var(--font-mono)" fill="var(--color-text-tertiary)">${prio}</text>
+      ${p>0?`<circle cx="${x+sW-9}" cy="${y+9}" r="8" fill="${fl==="danger"?"rgba(209,55,55,0.3)":"rgba(186,117,23,0.3)"}" stroke="${strMap[fl]}" stroke-width="0.5"/>
+      <text x="${x+sW-9}" y="${y+9}" text-anchor="middle" dominant-baseline="central" style="font-size:8px;font-weight:500;font-family:var(--font-mono)" fill="${fl==="danger"?"var(--color-text-danger)":"var(--color-text-warning)"}">${p}</text>`:""}
+      ${a?`<circle cx="${x+9}" cy="${y+9}" r="5" fill="rgba(24,95,165,0.3)" stroke="var(--color-border-info)" stroke-width="0.5"/>
+      <text x="${x+9}" y="${y+9}" text-anchor="middle" dominant-baseline="central" style="font-size:7px" fill="var(--color-text-info)">A</text>`:""}
+    </g>`;
+  });
+
+  // Base labels and drone icons
+  const bases=["NORTE","SUL","LESTE","OESTE"];
+  let baseLabels="";
+  bases.forEach(base=>{
+    const drs=STATE.drones.filter(d=>d.base===base);
+    const free=drs.filter(d=>d.state==="LIVRE").length;
+    const lost=drs.filter(d=>d.state==="PERDIDO").length;
+    const col=lost>0?"var(--color-text-danger)":free>0?"var(--color-text-success)":"var(--color-text-warning)";
+    let bx,by,anchor="middle";
+    if(base==="NORTE"){bx=totalW/2;by=13;}
+    else if(base==="SUL"){bx=totalW/2;by=totalH-4;}
+    else if(base==="OESTE"){bx=3;by=totalH/2-5;anchor="start";}
+    else{bx=totalW-3;by=totalH/2-5;anchor="end";}
+    baseLabels+=`<text x="${bx}" y="${by}" text-anchor="${anchor}" style="font-size:8px;font-weight:500;font-family:var(--font-mono)" fill="${col}">${base} [${free}/${drs.length}]</text>`;
+
+    // Drone triangles
+    drs.forEach((drone,i)=>{
+      const stC=c_state(drone.state);
+      const op=drone.state==="PERDIDO"?0.35:1;
+      let dx,dy;
+      if(base==="NORTE"){dx=totalW/2-((drs.length-1)*8)+i*16;dy=20;}
+      else if(base==="SUL"){dx=totalW/2-((drs.length-1)*8)+i*16;dy=totalH-14;}
+      else if(base==="OESTE"){dx=12;dy=totalH/2-((drs.length-1)*7)+i*14;}
+      else{dx=totalW-12;dy=totalH/2-((drs.length-1)*7)+i*14;}
+      dronePts+=`<polygon points="${dx},${dy-5} ${dx-5},${dy+4} ${dx+5},${dy+4}" fill="${stC}" opacity="${op}" stroke="none"/>`;
+    });
+  });
+
+  return `<svg width="100%" viewBox="0 0 ${totalW} ${totalH}" style="display:block">
+    ${baseLabels}
+    ${sectors}
+    ${dronePts}
+  </svg>`;
+}
+
+function renderDroneCard(d) {
+  const shortId=d.id.replace("DRONE-","");
+  const mShort=d.mission?d.mission.slice(0,6):"—";
+  return `<div style="display:flex;align-items:center;gap:8px;padding:7px 10px;border-radius:var(--border-radius-md);background:var(--color-background-primary);border:0.5px solid var(--color-border-tertiary);margin-bottom:5px">
+    <div style="width:8px;height:8px;border-radius:50%;flex-shrink:0;background:${c_state(d.state)}"></div>
+    <div style="flex:1;min-width:0">
+      <div class="mono" style="font-size:11px;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--color-text-primary)">${d.id}</div>
+      <div style="font-size:10px;color:var(--color-text-secondary)">Base: ${d.base} · P:${d.port} · Missao:${mShort}</div>
+    </div>
+    <span class="badge" style="background:${bg_state(d.state)};color:${c_state(d.state)};border-color:${c_state(d.state)}22">${d.state}</span>
+    <div style="display:flex;gap:4px;flex-shrink:0">
+      ${d.state==="PERDIDO"?`<button onclick="reviveDrone('${d.id}')" style="font-size:10px;padding:2px 7px;color:var(--color-text-success)">↺ Reconectar</button>`:""}
+      ${d.state==="LIVRE"?`<button onclick="killDrone('${d.id}')" style="font-size:10px;padding:2px 7px;color:var(--color-text-danger)">✕ Derrubar</button>`:""}
+      ${d.state!=="OCUPADO"?`<button onclick="removeDrone('${d.id}')" style="font-size:10px;padding:2px 5px">−</button>`:""}
+    </div>
+  </div>`;
+}
+
+function renderQueueItem(r) {
+  const done=r.status==="CONCLUIDA";
+  const active=r.status==="ACEITA";
+  return `<div style="display:flex;align-items:center;gap:5px;padding:5px 8px;border-radius:var(--border-radius-md);background:${active?"var(--color-background-info)":"var(--color-background-primary)"};border:0.5px solid var(--color-border-tertiary);margin-bottom:3px;opacity:${done?"0.45":"1"}">
+    <div style="width:7px;height:7px;border-radius:50%;flex-shrink:0;background:${done?"var(--color-text-tertiary)":c_crit(r.crit)}"></div>
+    <span class="mono" style="font-size:11px;font-weight:500;min-width:22px;color:var(--color-text-primary)">${r.sector}</span>
+    <span style="flex:1;font-size:10px;color:var(--color-text-secondary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${r.tipo.replace(/_/g," ")}</span>
+    <span class="badge" style="background:${done?"var(--color-background-secondary)":bg_crit(r.crit)};color:${done?"var(--color-text-tertiary)":c_crit(r.crit)};border-color:${done?"transparent":c_crit(r.crit)+"33"}">${r.crit.slice(0,3)}</span>
+    <span class="mono" style="font-size:9px;min-width:32px;text-align:right;color:${r.status==="PENDENTE"?"var(--color-text-warning)":r.status==="ACEITA"?"var(--color-text-info)":"var(--color-text-tertiary)"}">${r.status==="PENDENTE"?"PEND":r.status==="ACEITA"?"ATIVO":"OK"}</span>
+    <span class="mono" style="font-size:9px;color:var(--color-text-tertiary);min-width:30px">L:${r.ts}</span>
+  </div>`;
+}
+
+function renderTabContent() {
+  const f=STATE.injectForm;
+  const crit=TIPO_CRIT[f.tipo];
+  const prio=PRIORITY_TABLE[f.sector];
+  const bc=STATE.bombCfg;
+  const nd=STATE.newDrone;
+  const pct=STATE.bombTotal>0?Math.round(STATE.bombSent/STATE.bombTotal*100):0;
+
+  if(STATE.tab==="inject") return `
+    <p style="margin:0 0 10px;font-size:12px;color:var(--color-text-secondary)">Simule um sensor enviando um alerta para todas as bases. A base com maior prioridade responderá mais rápido.</p>
+    <div style="margin-bottom:8px"><label style="font-size:12px;color:var(--color-text-secondary);display:block;margin-bottom:4px">Setor de ocorrência</label>
+    <select onchange="STATE.injectForm.sector=this.value;render()" style="width:100%">
+      ${["S1","S2","S3","S4","S5","S6","S7","S8"].map(s=>`<option value="${s}" ${f.sector===s?"selected":""}>${s} — 1ª prioridade: ${PRIORITY_TABLE[s][0]}</option>`).join("")}
+    </select></div>
+    <div style="margin-bottom:10px"><label style="font-size:12px;color:var(--color-text-secondary);display:block;margin-bottom:4px">Tipo de ocorrência</label>
+    <select onchange="STATE.injectForm.tipo=this.value;render()" style="width:100%">
+      ${TIPOS.map(t=>`<option value="${t}" ${f.tipo===t?"selected":""}>${t.replace(/_/g," ")} [${TIPO_CRIT[t]}]</option>`).join("")}
+    </select></div>
+    <div style="padding:10px;border-radius:var(--border-radius-md);background:var(--color-background-primary);border:0.5px solid var(--color-border-tertiary);margin-bottom:10px;font-size:11px">
+      <div>Criticidade: <strong style="color:${c_crit(crit)}">${crit}</strong></div>
+      <div style="margin-top:3px">Prioridade: <strong style="color:var(--color-text-success)">${prio[0]}</strong> &gt; ${prio[1]} &gt; ${prio[2]} &gt; ${prio[3]}</div>
+      <div style="margin-top:3px">Timeouts: <span class="mono">0ms / 200ms / 400ms / 600ms</span></div>
+    </div>
+    <button onclick="injectAlert(STATE.injectForm.sector,STATE.injectForm.tipo,'${crit}')" style="width:100%;padding:9px;font-weight:500;background:var(--color-background-info);color:var(--color-text-info);border-color:var(--color-border-info)22">
+      Enviar Alerta → Broadcast para 4 Bases
+    </button>
+    <div style="margin-top:12px;display:flex;align-items:center;gap:8px">
+      <input type="checkbox" id="auto-sim" ${STATE.autoSim?"checked":""} onchange="STATE.autoSim=this.checked">
+      <label for="auto-sim" style="font-size:12px;color:var(--color-text-secondary);cursor:pointer">Simulação automática de sensores (4.5s)</label>
+    </div>`;
+
+  if(STATE.tab==="stress") return `
+    <p style="margin:0 0 10px;font-size:12px;color:var(--color-text-secondary)">Teste de carga: bombardeie o sistema com alertas simultâneos e observe a priorização, exclusão mútua e replanejamento.</p>
+    <div style="margin-bottom:8px">
+      <div style="display:flex;justify-content:space-between;font-size:12px;color:var(--color-text-secondary);margin-bottom:4px"><span>Número de alertas</span><span class="mono" style="font-weight:500">${bc.count}</span></div>
+      <input type="range" min="5" max="100" step="5" value="${bc.count}" ${STATE.bombarding?"disabled":""} oninput="STATE.bombCfg.count=+this.value;render()">
+    </div>
+    <div style="margin-bottom:8px">
+      <div style="display:flex;justify-content:space-between;font-size:12px;color:var(--color-text-secondary);margin-bottom:4px"><span>Taxa (alertas/s)</span><span class="mono" style="font-weight:500">${bc.rate}</span></div>
+      <input type="range" min="1" max="20" step="1" value="${bc.rate}" ${STATE.bombarding?"disabled":""} oninput="STATE.bombCfg.rate=+this.value;render()">
+    </div>
+    <div style="margin-bottom:8px"><label style="font-size:12px;color:var(--color-text-secondary);display:block;margin-bottom:4px">Setores alvo</label>
+    <select ${STATE.bombarding?"disabled":""} onchange="STATE.bombCfg.sectors=this.value" style="width:100%">
+      <option value="all" ${bc.sectors==="all"?"selected":""}>Todos (aleatório)</option>
+      ${["S1","S2","S3","S4","S5","S6","S7","S8"].map(s=>`<option value="${s}" ${bc.sectors===s?"selected":""}>${s}</option>`).join("")}
+    </select></div>
+    <div style="margin-bottom:10px"><label style="font-size:12px;color:var(--color-text-secondary);display:block;margin-bottom:4px">Distribuição de criticidade</label>
+    <select ${STATE.bombarding?"disabled":""} onchange="STATE.bombCfg.criticidade=this.value" style="width:100%">
+      <option value="mixed" ${bc.criticidade==="mixed"?"selected":""}>Misto (20% CRITICA / 30% ALTA / 50% BAIXA)</option>
+      <option value="CRITICA" ${bc.criticidade==="CRITICA"?"selected":""}>Apenas CRITICA</option>
+      <option value="ALTA" ${bc.criticidade==="ALTA"?"selected":""}>Apenas ALTA</option>
+      <option value="BAIXA" ${bc.criticidade==="BAIXA"?"selected":""}>Apenas BAIXA</option>
+    </select></div>
+    ${STATE.bombarding?`<div style="padding:10px;background:var(--color-background-warning);border:0.5px solid var(--color-border-warning);border-radius:var(--border-radius-md);margin-bottom:8px">
+      <div class="mono" style="font-size:12px;color:var(--color-text-warning)">BOMBARDEANDO... ${STATE.bombSent}/${STATE.bombTotal}</div>
+      <div style="margin-top:6px;height:5px;background:var(--color-background-secondary);border-radius:3px;overflow:hidden">
+        <div style="height:100%;width:${pct}%;background:var(--color-text-warning);transition:width 0.2s"></div>
+      </div>
+    </div>`:""}
+    ${STATE.bombarding
+      ?`<button onclick="stopBombard()" style="width:100%;padding:9px;font-weight:500;background:var(--color-background-danger);color:var(--color-text-danger);border-color:var(--color-border-danger)22">Parar Bombardeamento</button>`
+      :`<button onclick="startBombard()" style="width:100%;padding:9px;font-weight:500;background:var(--color-background-warning);color:var(--color-text-warning);border-color:var(--color-border-warning)22">Iniciar Bombardeamento</button>`}`;
+
+  if(STATE.tab==="drone") return `
+    <p style="margin:0 0 10px;font-size:12px;color:var(--color-text-secondary)">Adicione drones ao sistema. Ao incluir, a fila é consultada e reprocessada automaticamente.</p>
+    <div style="margin-bottom:8px"><label style="font-size:12px;color:var(--color-text-secondary);display:block;margin-bottom:4px">ID do Drone</label>
+    <input type="text" placeholder="Ex: DRONE-NORTE-2" value="${nd.id}" oninput="STATE.newDrone.id=this.value"></div>
+    <div style="margin-bottom:8px"><label style="font-size:12px;color:var(--color-text-secondary);display:block;margin-bottom:4px">Base de Origem</label>
+    <select onchange="STATE.newDrone.base=this.value" style="width:100%">
+      ${["NORTE","SUL","LESTE","OESTE"].map(b=>`<option value="${b}" ${nd.base===b?"selected":""}>${b}</option>`).join("")}
+    </select></div>
+    <div style="margin-bottom:10px"><label style="font-size:12px;color:var(--color-text-secondary);display:block;margin-bottom:4px">Porta TCP</label>
+    <input type="number" value="${nd.port}" oninput="STATE.newDrone.port=+this.value"></div>
+    <button onclick="addDrone()" ${!nd.id.trim()?"disabled":""} style="width:100%;padding:9px;font-weight:500;background:var(--color-background-success);color:var(--color-text-success);border-color:var(--color-border-success)22;margin-bottom:12px">
+      Adicionar Drone ao Sistema
+    </button>
+    <div style="font-size:12px;font-weight:500;margin-bottom:8px;color:var(--color-text-primary)">Ações nos drones ativos</div>
+    ${STATE.drones.map(d=>`<div style="display:flex;align-items:center;justify-content:space-between;padding:6px 0;border-bottom:0.5px solid var(--color-border-tertiary)">
+      <div>
+        <div class="mono" style="font-size:11px;color:var(--color-text-primary)">${d.id.replace("DRONE-","")}</div>
+        <div style="font-size:10px;color:${c_state(d.state)}">${d.state}</div>
+      </div>
+      <div style="display:flex;gap:6px">
+        ${d.state==="PERDIDO"?`<button onclick="reviveDrone('${d.id}')" style="font-size:11px;color:var(--color-text-success)">Reconectar</button>`:""}
+        ${d.state==="LIVRE"?`<button onclick="killDrone('${d.id}')" style="font-size:11px;color:var(--color-text-danger)">Derrubar</button>`:""}
+        ${d.state!=="OCUPADO"?`<button onclick="removeDrone('${d.id}')" style="font-size:11px">Remover</button>`:""}
+        ${d.state==="OCUPADO"?`<span style="font-size:11px;color:var(--color-text-warning)">Em missao</span>`:""}
+      </div>
+    </div>`).join("")}`;
+
+  if(STATE.tab==="bridge") return `
+    <p style="margin:0 0 10px;font-size:12px;color:var(--color-text-secondary)">Conecte este painel ao sistema Python real. O broker já envia eventos UDP para a porta 8000 via <span class="mono">notificar_monitor()</span>.</p>
+    <div style="margin-bottom:8px"><label style="font-size:12px;color:var(--color-text-secondary);display:block;margin-bottom:4px">URL WebSocket</label>
+    <input type="text" value="${STATE.wsUrl}" oninput="STATE.wsUrl=this.value"></div>
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
+      <div style="width:8px;height:8px;border-radius:50%;background:${STATE.wsStatus==="connected"?"var(--color-text-success)":STATE.wsStatus==="error"?"var(--color-text-danger)":"var(--color-text-tertiary)"}"></div>
+      <span style="font-size:12px;color:var(--color-text-secondary)">${STATE.wsStatus==="connected"?"Conectado ao sistema real":STATE.wsStatus==="error"?"Erro de conexao":"Modo simulacao"}</span>
+    </div>
+    <button onclick="${STATE.wsStatus==="connected"?"STATE.wsObj&&STATE.wsObj.close()":"connectWs()"}" style="width:100%;padding:9px;font-weight:500;margin-bottom:12px;background:${STATE.wsStatus==="connected"?"var(--color-background-danger)":"var(--color-background-success)"};color:${STATE.wsStatus==="connected"?"var(--color-text-danger)":"var(--color-text-success)"};border-color:transparent">
+      ${STATE.wsStatus==="connected"?"Desconectar":"Conectar ao Sistema Real"}
+    </button>
+    <div style="font-size:12px;font-weight:500;margin-bottom:6px">monitor_bridge.py — execute no PC do monitor:</div>
+    <div style="background:var(--color-background-primary);border:0.5px solid var(--color-border-tertiary);border-radius:var(--border-radius-md);padding:10px">
+<pre>import asyncio, websockets, socket, json
+
+async def main():
+    clients = set()
+    sock = socket.socket(
+        socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(("0.0.0.0", 8000))
+    sock.setblocking(False)
+
+    async def ws_handler(ws):
+        clients.add(ws)
+        try:
+            async for _ in ws: pass
+        finally: clients.discard(ws)
+
+    async def udp_loop():
+        loop = asyncio.get_event_loop()
+        while True:
+            data = await loop.sock_recv(
+                sock, 4096)
+            evt = json.loads(data)
+            for ws in set(clients):
+                try: await ws.send(
+                    json.dumps(evt))
+                except: clients.discard(ws)
+
+    srv = await websockets.serve(
+        ws_handler, "0.0.0.0", 8001)
+    print("Bridge UDP:8000 -> WS:8001")
+    await asyncio.gather(
+        srv.wait_closed(), udp_loop())
+
+asyncio.run(main())
+# pip install websockets</pre></div>`;
+  return "";
+}
+
+function render() {
+  const S=STATE;
+  S.lamport=lamportClock;
+
+  const qSorted=[...S.queue].sort((a,b)=>{
+    const ord={PENDENTE:0,ACEITA:1,CONCLUIDA:2};
+    if(ord[a.status]!==ord[b.status]) return ord[a.status]-ord[b.status];
+    return (CRIT_PESO[b.crit]||1)-(CRIT_PESO[a.crit]||1);
+  }).slice(0,30);
+
+  const pendN=S.queue.filter(r=>r.status==="PENDENTE").length;
+  const actN=S.queue.filter(r=>r.status==="ACEITA").length;
+  const freeN=S.drones.filter(d=>d.state==="LIVRE").length;
+
+  const tabs=[{k:"inject",l:"Injetar Alerta"},{k:"stress",l:"Stress Test"},{k:"drone",l:"Drones"},{k:"bridge",l:"Bridge"}];
+
+  document.getElementById("app").innerHTML = `
+  <h2 style="sr-only">Ormuz Command Center — sistema distribuído de monitoramento marítimo</h2>
+
+  <div style="display:flex;align-items:flex-start;justify-content:space-between;padding:10px 0 14px;border-bottom:0.5px solid var(--color-border-tertiary);margin-bottom:14px;flex-wrap:wrap;gap:8px">
+    <div>
+      <div class="mono" style="font-size:17px;font-weight:500;color:var(--color-text-primary)">ORMUZ COMMAND CENTER</div>
+      <div style="font-size:11px;color:var(--color-text-secondary);margin-top:2px">Infraestrutura distribuída — monitoramento marítimo do Estreito de Ormuz</div>
+    </div>
+    <div style="display:flex;gap:6px;flex-wrap:wrap">
+      ${[
+        {l:"LAMPORT",v:S.lamport,c:"var(--color-text-primary)"},
+        {l:"ALERTAS",v:S.stats.total,c:"var(--color-text-primary)"},
+        {l:"ACEITAS",v:S.stats.aceitas,c:"var(--color-text-info)"},
+        {l:"CONCLUÍDAS",v:S.stats.concluidas,c:"var(--color-text-success)"},
+        {l:"PERDIDOS",v:S.stats.perdidos,c:"var(--color-text-danger)"},
+      ].map(x=>`<div style="background:var(--color-background-secondary);border:0.5px solid var(--color-border-tertiary);border-radius:var(--border-radius-md);padding:5px 10px;text-align:center;min-width:60px">
+        <div style="font-size:9px;color:var(--color-text-tertiary);margin-bottom:2px">${x.l}</div>
+        <div class="mono" style="font-size:18px;font-weight:500;color:${x.c};line-height:1">${x.v}</div>
+      </div>`).join("")}
+      <div style="background:${S.wsStatus==="connected"?"var(--color-background-success)":"var(--color-background-secondary)"};border:0.5px solid var(--color-border-tertiary);border-radius:var(--border-radius-md);padding:5px 10px;text-align:center;cursor:pointer" onclick="STATE.tab='bridge';render()">
+        <div style="font-size:9px;color:var(--color-text-tertiary);margin-bottom:2px">STATUS</div>
+        <div class="mono" style="font-size:12px;font-weight:500;color:${S.wsStatus==="connected"?"var(--color-text-success)":S.wsStatus==="error"?"var(--color-text-danger)":"var(--color-text-warning)"}">${S.wsStatus==="connected"?"REAL":S.wsStatus==="error"?"ERRO":"SIM"}</div>
+      </div>
+    </div>
+  </div>
+
+  <div style="display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr) minmax(0,1fr);gap:12px">
+
+    <div style="display:flex;flex-direction:column;gap:10px">
+
+      <div class="card">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+          <span style="font-size:13px;font-weight:500">Mapa Tático</span>
+          <div style="display:flex;gap:4px">
+            <span class="badge" style="background:${pendN>0?"var(--color-background-warning)":"var(--color-background-secondary)"};color:${pendN>0?"var(--color-text-warning)":"var(--color-text-tertiary)"};border-color:transparent">${pendN} pend.</span>
+            <span class="badge" style="background:var(--color-background-info);color:var(--color-text-info);border-color:transparent">${actN} ativas</span>
+          </div>
+        </div>
+        ${renderMap()}
+        <div style="margin-top:6px;display:flex;gap:8px;font-size:10px;color:var(--color-text-tertiary)">
+          <span>▲ drones</span>
+          <span style="color:var(--color-text-success)">verde=LIVRE</span>
+          <span style="color:var(--color-text-warning)">laranja=OCUP.</span>
+          <span style="color:var(--color-text-danger)">verm.=PERD.</span>
+        </div>
+      </div>
+
+      <div class="card">
+        <div style="font-size:13px;font-weight:500;margin-bottom:8px">
+          Frota de Drones
+          <span style="font-size:11px;font-weight:400;color:var(--color-text-secondary);margin-left:6px">${freeN} livres / ${S.drones.length} total</span>
+        </div>
+        ${S.drones.map(renderDroneCard).join("")}
+      </div>
+
+      <div class="card">
+        <div style="font-size:13px;font-weight:500;margin-bottom:8px">Tabela de Prioridades por Setor</div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:4px">
+          ${Object.entries(PRIORITY_TABLE).map(([s,o])=>`<div style="padding:5px 8px;background:var(--color-background-primary);border:0.5px solid var(--color-border-tertiary);border-radius:var(--border-radius-md);font-size:10px">
+            <span class="mono" style="font-weight:500">${s}</span>: ${o.map((b,i)=>`<span style="color:${i===0?"var(--color-text-success)":"var(--color-text-tertiary)"}">${i>0?" > ":""}${b[0]}</span>`).join("")}
+          </div>`).join("")}
+        </div>
+      </div>
+    </div>
+
+    <div style="display:flex;flex-direction:column;gap:10px">
+
+      <div class="card" style="flex:none">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+          <span style="font-size:13px;font-weight:500">Fila Distribuída Replicada</span>
+          <button onclick="STATE.queue=[];render()" style="font-size:11px;padding:3px 8px">Limpar</button>
+        </div>
+        <div style="font-size:11px;color:var(--color-text-secondary);margin-bottom:8px">
+          Ordenada por: criticidade (CRITICA>ALTA>BAIXA) → timestamp Lamport → setor
+        </div>
+        <div class="scroll" style="max-height:260px">
+          ${qSorted.length===0
+            ?`<div style="text-align:center;padding:28px 0;color:var(--color-text-tertiary);font-size:13px">Fila vazia — aguardando alertas</div>`
+            :qSorted.map(renderQueueItem).join("")}
+        </div>
+      </div>
+
+      <div class="card">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+          <span style="font-size:13px;font-weight:500">Log de Eventos</span>
+          <button onclick="STATE.events=[];render()" style="font-size:11px;padding:3px 8px">Limpar</button>
+        </div>
+        <div class="scroll mono" style="max-height:300px;font-size:10px;line-height:1.7">
+          ${S.events.slice(0,60).map(ev=>`<div style="display:flex;gap:8px;padding:1px 0;border-bottom:0.5px solid var(--color-border-tertiary)22">
+            <span style="color:var(--color-text-tertiary);flex-shrink:0">${ev.ts}</span>
+            <span style="color:${c_log(ev.level)}">${ev.msg}</span>
+          </div>`).join("")}
+          ${S.events.length===0?`<div style="color:var(--color-text-tertiary);padding:8px 0">Aguardando eventos...</div>`:""}
+        </div>
+      </div>
+    </div>
+
+    <div style="display:flex;flex-direction:column;gap:10px">
+      <div class="card">
+
+        <div style="display:grid;grid-template-columns:repeat(4,1fr);margin:-12px -12px 12px;border-bottom:0.5px solid var(--color-border-tertiary)">
+          ${tabs.map(t=>`<button onclick="STATE.tab='${t.k}';render()" style="padding:9px 4px;font-size:11px;font-weight:${S.tab===t.k?500:400};background:${S.tab===t.k?"var(--color-background-primary)":"transparent"};border:none;border-radius:0;border-bottom:${S.tab===t.k?"2px solid var(--color-text-info)":"2px solid transparent"};color:${S.tab===t.k?"var(--color-text-primary)":"var(--color-text-secondary)"};cursor:pointer;transition:all 0.15s">${t.l}</button>`).join("")}
+        </div>
+
+        ${renderTabContent()}
+      </div>
+    </div>
+  </div>`;
+}
+
+// Expose functions globally for onclick handlers
+window.STATE=STATE;
+window.render=render;
+window.injectAlert=injectAlert;
+window.startBombard=startBombard;
+window.stopBombard=stopBombard;
+window.addDrone=addDrone;
+window.killDrone=killDrone;
+window.reviveDrone=reviveDrone;
+window.removeDrone=removeDrone;
+window.connectWs=connectWs;
+window.processQueue=processQueue;
+
+// INIT
+log("Sistema ORMUZ COMMAND CENTER iniciado","success");
+log("4 bases ativas: NORTE, SUL, LESTE, OESTE","info");
+log("4 drones registrados e prontos","info");
+log("Modo Simulacao automatica ativo — gerando alertas a cada ~4.5s","info");
+render();
+startAutoSim();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,15 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# Avisa ao Python para procurar módulos dentro da pasta shared também
+ENV PYTHONPATH="/app/shared"
+
+# 1. Copia a pasta shared
+COPY shared/ ./shared/
+
+# 2. Copia TODOS os arquivos da pasta setor
+COPY setor/ .
+
+# 3. Inicia o broker
+CMD ["python", "broker_setor.py"]

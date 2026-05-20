@@ -1,0 +1,16 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Copia as pastas com os nomes corretos
+COPY shared/ ./shared/
+COPY config/ ./config/
+COPY base/ ./base/
+
+# Entra na pasta renomeada
+WORKDIR /app/base
+
+EXPOSE 6001 6101/udp
+
+# Executa o script com o novo nome
+CMD ["python", "broker.py"]

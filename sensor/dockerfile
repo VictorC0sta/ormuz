@@ -1,0 +1,16 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# 1. O segredo de ouro: avisa o Python para ler a pasta shared
+ENV PYTHONPATH="/app/shared"
+
+# 2. Copia a pasta shared para dentro do contêiner
+COPY shared/ ./shared/
+
+# 3. Copia TODOS os arquivos da pasta de sensores soltos na raiz /app
+COPY sensor/ . 
+# (OBS: Se a sua pasta física se chamar 'sensor' sem o 'es' no final, mude a linha acima para COPY sensor/ .)
+
+# 4. Inicia o script do sensor
+CMD ["python", "sensor.py"]
