@@ -12,6 +12,7 @@ import logging
 from typing import Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -22,21 +23,29 @@ TIMEOUT_TCP = 2.0  # Timeout curto para evitar bloqueios no broadcast
 
 # ── TCP — Envio ──────────────────────────────────────────────────────────────
 
-def tcp_enviar(host: str, porta: int, payload: dict) -> bool:
-    """Envia payload JSON via TCP prefixado com seu tamanho (4 bytes)."""
-    try:
-        dados = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        header = struct.pack(">I", len(dados))
+def tcp_enviar(host: str, porta: int, payload: dict, max_tentativas: int = 3) -> bool:
+    """
+    Envia payload JSON via TCP prefixado com seu tamanho (4 bytes).
+    Implementa lógica de RETRANSMISSÃO (Retry) em caso de falha de rede.
+    """
+    dados = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    header = struct.pack(">I", len(dados))
 
-        with socket.create_connection((host, porta), timeout=TIMEOUT_TCP) as s:
-            s.sendall(header + dados)
+    for tentativa in range(1, max_tentativas + 1):
+        try:
+            with socket.create_connection((host, porta), timeout=TIMEOUT_TCP) as s:
+                s.sendall(header + dados)
+            
+            logger.debug("[TCP] Enviado para %s:%s — %d bytes (Tentativa %d)", host, porta, len(dados), tentativa)
+            return True
 
-        logger.debug("[TCP] Enviado para %s:%s — %d bytes", host, porta, len(dados))
-        return True
-
-    except (ConnectionRefusedError, TimeoutError, OSError) as e:
-        logger.warning("[TCP] Falha ao enviar para %s:%s — %s", host, porta, e)
-        return False
+        except (ConnectionRefusedError, TimeoutError, OSError) as e:
+            if tentativa < max_tentativas:
+                logger.warning("[TCP] Falha ao enviar para %s:%s. Retentando (%d/%d)...", host, porta, tentativa, max_tentativas)
+                time.sleep(0.5) # Pausa meio segundo antes de tentar de novo
+            else:
+                logger.error("[TCP] Falha definitiva ao enviar para %s:%s após %d tentativas — %s", host, porta, max_tentativas, e)
+                return False
 
 
 def tcp_broadcast(destinos: list[tuple[str, int]], payload: dict) -> dict[str, bool]:
