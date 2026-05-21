@@ -1,8 +1,11 @@
 """
 broker.py — Broker de Base (Ormuz Command Center)
 
-Responsável por manter a fila de requisições, gerenciar drones locais
-e executar exclusão mútua distribuída por timeout de prioridade.
+Papel na arquitetura:
+    É o cérebro descentralizado das bases operacionais (Norte, Sul, Leste, Oeste).
+    Responsável por manter uma cópia local da Fila Replicada, gerenciar a frota 
+    de drones locais e executar o algoritmo de exclusão mútua distribuída 
+    (baseado em timeout por prioridade) para decidir quem atende cada ocorrência.
 """
 
 import os
@@ -38,10 +41,11 @@ logger = logging.getLogger("base")
 
 # ── Configuração via ambiente ─────────────────────────────────────────────────
 BASE_ID         = os.environ.get("BASE_ID", "NORTE")
-MINHA_PORTA     = int(os.environ.get("MINHA_PORTA", "6001"))
-MINHA_PORTA_UDP = int(os.environ.get("MINHA_PORTA_UDP", "6101"))
+MINHA_PORTA     = int(os.environ.get("MINHA_PORTA", "6001"))      # Escuta comandos TCP
+MINHA_PORTA_UDP = int(os.environ.get("MINHA_PORTA_UDP", "6101"))  # Escuta heartbeats UDP
 IP_PC_DRONES    = os.environ.get("IP_PC_DRONES", "127.0.0.1")
 
+# Mapeamento de todas as bases para o broadcast TCP
 TODAS_AS_BASES = {
     "NORTE": (os.environ.get("IP_BASE_NORTE", "127.0.0.1"), int(os.environ.get("PORTA_BASE_NORTE", "6001"))),
     "SUL":   (os.environ.get("IP_BASE_SUL",   "127.0.0.1"), int(os.environ.get("PORTA_BASE_SUL",   "6002"))),
@@ -49,53 +53,61 @@ TODAS_AS_BASES = {
     "OESTE": (os.environ.get("IP_BASE_OESTE", "127.0.0.1"), int(os.environ.get("PORTA_BASE_OESTE", "6004"))),
 }
 
-# Destinos do broadcast de ACEITE (exclui a própria base)
+# Destinos do broadcast de ACEITE (lista de tuplas IP/Porta, excluindo a própria base)
 OUTRAS_BASES = [
     (host, porta)
     for base_id, (host, porta) in TODAS_AS_BASES.items()
     if base_id != BASE_ID
 ]
 
-# Tempo máximo sem heartbeat antes de declarar o drone como PERDIDO
+# Tempo máximo sem receber pacote UDP antes de considerar o drone abatido/perdido
 HEARTBEAT_TIMEOUT_S = float(
     os.environ.get("HEARTBEAT_TIMEOUT", str(HEARTBEAT_INTERVALO_S * (HEARTBEAT_MAX_FALHAS + 1)))
 )
 
 # ── Instâncias Globais ────────────────────────────────────────────────────────
-clock      = LamportClock()
-estado     = FilaReplicada()
-prioridade = GerenciadorPrioridade(BASE_ID)
+clock      = LamportClock()                   # Relógio lógico para ordenação global de eventos
+estado     = FilaReplicada()                  # Estrutura de dados thread-safe da fila
+prioridade = GerenciadorPrioridade(BASE_ID)   # Define o tempo de espera (timeout) desta base
 
-# Controle de timers pendentes para aceitação de missões
+# Controle de timers para o mecanismo de exclusão mútua distribuída
 _timers: dict[str, threading.Timer] = {}
 _timers_lock = threading.Lock()
 
 
-# ── Exclusão Mútua ────────────────────────────────────────────────────────────
+# ── Algoritmo de Exclusão Mútua Distribuída ───────────────────────────────────
 
 def _tentar_aceitar(id_requisicao: str) -> None:
-    """Tenta aceitar a requisição após o timeout de prioridade."""
+    """
+    Função engatilhada pelo Timer de prioridade.
+    Tenta garantir atomicamente a posse da requisição caso nenhuma base
+    mais prioritária tenha aceitado a missão durante o período de espera.
+    """
+    # Remove o timer do controle de pendências
     with _timers_lock:
         _timers.pop(id_requisicao, None)
 
+    # Verifica se a ocorrência já foi capturada por outra base
     status = estado.status_requisicao(id_requisicao)
     if status != StatusRequisicao.PENDENTE.value:
         logger.debug("[%s] Req %s já está '%s'.", BASE_ID, id_requisicao[:8], status)
         return
 
+    # Procura um recurso ocioso local
     drone = estado.drone_livre()
     if drone is None:
         logger.info("[%s] Sem drone livre para req %s — aguardando.", BASE_ID, id_requisicao[:8])
         return
 
-    # Evita race condition local
+    # Tenta cravar a requisição localmente. O lock interno previne race conditions (ex: duas threads locais).
     if not estado.marcar_aceita(id_requisicao):
         return
 
+    # Aloca formalmente o drone para a missão
     estado.ocupar_drone(drone.drone_id, id_requisicao)
-    logger.info("[%s] ✔ Aceitando req %s → drone %s", BASE_ID, id_requisicao[:8], drone.drone_id)
+    logger.info("[%s] Aceitando req %s -> drone %s", BASE_ID, id_requisicao[:8], drone.drone_id)
 
-    # Avisa outras bases para cancelarem seus timers
+    # Passo crucial: Avisa a malha que pegou a missão, forçando as outras bases a cancelarem seus timers.
     aceite = {
         "tipo": TipoMensagem.ACEITE.value,
         "id_requisicao": id_requisicao,
@@ -104,11 +116,13 @@ def _tentar_aceitar(id_requisicao: str) -> None:
         "timestamp_logico": clock.incrementar(),
     }
     tcp_broadcast(OUTRAS_BASES, aceite)
+    
+    # Envia os dados táticos para o hardware do drone
     _despachar_drone(drone, id_requisicao)
 
 
 def _despachar_drone(drone, id_requisicao: str) -> None:
-    """Envia a missão ao drone via TCP."""
+    """Envia o comando de missão fisicamente via TCP para o contêiner do Drone."""
     entrada = estado.obter_entrada(id_requisicao)
     if not entrada:
         return
@@ -126,6 +140,7 @@ def _despachar_drone(drone, id_requisicao: str) -> None:
     if tcp_enviar(IP_PC_DRONES, drone.porta_tcp, missao):
         logger.info("[%s] Drone %s despachado para req %s", BASE_ID, drone.drone_id, id_requisicao[:8])
     else:
+        # Se a porta do drone recusar conexão, assume falha imediata do hardware
         logger.warning("[%s] Falha ao contatar drone %s.", BASE_ID, drone.drone_id)
         _tratar_drone_perdido(drone.drone_id)
 
@@ -137,14 +152,20 @@ def _despachar_drone(drone, id_requisicao: str) -> None:
     })
 
 
-# ── Handlers de Mensagens TCP ─────────────────────────────────────────────────
+# ── Roteadores de Mensagens (Handlers TCP) ────────────────────────────────────
 
 def _processar_requisicao(msg: dict) -> None:
-    """Recebe nova requisição, atualiza Lamport e agenda o timer de prioridade."""
+    """
+    Recebeu alerta do Setor.
+    1. Sincroniza o relógio de Lamport.
+    2. Registra na fila.
+    3. Dá start no cronômetro (Timer) correspondente ao seu nível de prioridade.
+    """
     id_req   = msg.get("id_requisicao", "")
     id_setor = msg.get("id_setor", "")
     ts       = msg.get("timestamp_logico", 0)
 
+    # Filtro de idempotência: ignora requisições duplicadas por broadcast
     if not estado.verificar_e_registrar_vista(id_req):
         return
 
@@ -172,7 +193,10 @@ def _processar_requisicao(msg: dict) -> None:
 
 
 def _processar_aceite(msg: dict) -> None:
-    """Registra aceite de outra base e cancela o timer local."""
+    """
+    Outra base pegou a missão.
+    Deve abortar a concorrência local, matando o Timer associado à requisição.
+    """
     id_req = msg.get("id_requisicao", "")
     ts     = msg.get("timestamp_logico", 0)
     clock.atualizar(ts)
@@ -185,16 +209,21 @@ def _processar_aceite(msg: dict) -> None:
 
 
 def _processar_registro(msg: dict) -> None:
-    """Registra um novo drone na frota e verifica se há missões pendentes."""
+    """Um drone acabou de ligar/conectar e está pronto para receber ordens."""
     drone_id  = msg.get("drone_id", "")
     porta_tcp = int(msg.get("porta", 7001))
     estado.registrar_drone(drone_id, porta_tcp)
     logger.info("[%s] Drone %s registrado (porta TCP %d).", BASE_ID, drone_id, porta_tcp)
+    
+    # Como ganhou um recurso novo, varre a fila para ver se tem missão encavalada
     threading.Thread(target=_processar_fila_pendente, daemon=True).start()
 
 
 def _processar_heartbeat_tcp(msg: dict) -> None:
-    """Processa a conclusão de uma missão reportada pelo drone."""
+    """
+    Recebe a confirmação explícita via TCP de que o drone retornou à base.
+    Marca a missão no histórico como CONCLUIDA.
+    """
     drone_id         = msg.get("drone_id", "")
     estado_drone     = msg.get("estado", EstadoDrone.LIVRE.value)
     missao_concluida = msg.get("missao_concluida")
@@ -204,6 +233,8 @@ def _processar_heartbeat_tcp(msg: dict) -> None:
     if missao_concluida:
         estado.marcar_concluida(missao_concluida)
         logger.info("[%s] Missão %s concluída pelo drone %s.", BASE_ID, missao_concluida[:8], drone_id)
+        
+        # Como o drone agora está livre, tenta puxar alguma ocorrência da fila de espera
         threading.Thread(target=_processar_fila_pendente, daemon=True).start()
 
         notificar_monitor({
@@ -215,11 +246,16 @@ def _processar_heartbeat_tcp(msg: dict) -> None:
 
 
 def _processar_reemissao(msg: dict) -> None:
-    """Recoloca na fila uma requisição de um drone que falhou."""
+    """
+    Handler de Tolerância a Falhas.
+    Outra base detectou que o drone dela caiu e devolveu a missão para a rede.
+    A base local reativa a requisição e agenda um novo Timer.
+    """
     id_req   = msg.get("id_requisicao", "")
     id_setor = msg.get("id_setor", "")
     clock.atualizar(msg.get("timestamp_logico_base", 0))
 
+    # Permite que a requisição seja processada novamente
     estado.remover_vista(id_req)
     entrada = estado.obter_entrada(id_req)
     
@@ -227,6 +263,7 @@ def _processar_reemissao(msg: dict) -> None:
         with estado.fila_lock:
             entrada.status = StatusRequisicao.PENDENTE.value
     else:
+        # Recuperação de estado caso a base nem tivesse a requisição original
         nova = EntradaFila(
             id_requisicao=id_req,
             id_setor=id_setor,
@@ -236,6 +273,7 @@ def _processar_reemissao(msg: dict) -> None:
         )
         estado.inserir_na_fila(nova)
 
+    # Dispara novamente a corrida de Exclusão Mútua
     timeout_s = prioridade.timeout_para_setor(id_setor)
     timer = threading.Timer(timeout_s, _tentar_aceitar, args=(id_req,))
     with _timers_lock:
@@ -243,22 +281,33 @@ def _processar_reemissao(msg: dict) -> None:
     timer.start()
 
 
-# ── Gestão da Fila Pendente ───────────────────────────────────────────────────
+# ── Mecanismos de Reavaliação ─────────────────────────────────────────────────
 
 def _processar_fila_pendente() -> None:
-    """Tenta aceitar requisições pendentes quando um drone fica livre."""
+    """
+    Varre as requisições ociosas na memória (status PENDENTE) sem timers ativos.
+    Isto garante o Encaminhamento Passivo: missões que as bases não puderam
+    atender por falta de drones não são perdidas, sendo capturadas assim que
+    a malha liberar recursos.
+    """
     pendentes = estado.obter_pendentes()
     for entrada in pendentes:
         with _timers_lock:
+            # Se a requisição já está competindo (tem timer), ignora
             if entrada.id_requisicao in _timers:
                 continue
         _tentar_aceitar(entrada.id_requisicao)
 
 
-# ── Tolerância a Falha de Drone ───────────────────────────────────────────────
+# ── Detectores de Anomalias na Frota ──────────────────────────────────────────
 
 def _tratar_drone_perdido(drone_id: str) -> None:
-    """Declara drone como PERDIDO e repassa sua missão para a fila global."""
+    """
+    Ação disparada quando um drone fica mudo.
+    Se ele carregava uma missão, o sistema executa o replanejamento automático
+    fazendo o broadcast de REEMISSAO para todas as bases devolverem a
+    ocorrência para a mesa de negociação.
+    """
     with estado.drones_lock:
         info = estado.drones.get(drone_id)
         if not info or info.estado == EstadoDrone.PERDIDO.value:
@@ -288,6 +337,7 @@ def _tratar_drone_perdido(drone_id: str) -> None:
         }
         tcp_broadcast(OUTRAS_BASES, reemissao)
 
+        # A própria base tentará reassumir a missão caso tenha outro drone disponível
         timeout_s = prioridade.timeout_para_setor(entrada.id_setor)
         timer = threading.Timer(timeout_s, _tentar_aceitar, args=(entrada.id_requisicao,))
         with _timers_lock:
@@ -295,10 +345,12 @@ def _tratar_drone_perdido(drone_id: str) -> None:
         timer.start()
 
 
-# ── Monitor de Heartbeat ──────────────────────────────────────────────────────
-
 def _monitor_heartbeat() -> None:
-    """Verifica periodicamente se algum drone excedeu o limite de tempo sem sinal."""
+    """
+    Vigia contínuo da frota. Roda em background analisando o timestamp de
+    cada drone registrado. Se a defasagem superar o HEARTBEAT_TIMEOUT_S,
+    aciona a rotina de drone perdido.
+    """
     while True:
         time.sleep(HEARTBEAT_INTERVALO_S)
         agora = time.time()
@@ -312,10 +364,11 @@ def _monitor_heartbeat() -> None:
                 _tratar_drone_perdido(info.drone_id)
 
 
-# ── Loop UDP (heartbeats periódicos dos drones) ───────────────────────────────
-
 def _loop_udp() -> None:
-    """Escuta heartbeats via UDP e atualiza o timestamp de último contato."""
+    """
+    Recepção contínua (fire-and-forget) dos pacotes UDP emitidos pelos drones.
+    O principal objetivo é atualizar o carimbo temporal de `ultimo_heartbeat`.
+    """
     servidor = criar_servidor_udp(MINHA_PORTA_UDP)
     while True:
         try:
@@ -337,16 +390,17 @@ def _loop_udp() -> None:
                     info.ultimo_heartbeat = time.time()
                     info.falhas_heartbeat = 0
                 else:
+                    # Auto-registro em caso de drone reiniciar sozinho
                     estado.registrar_drone(drone_id, porta, estado_drone)
 
         except Exception as e:
             logger.error("[%s] Erro UDP: %s", BASE_ID, e)
 
 
-# ── Dispatcher de Mensagens TCP ───────────────────────────────────────────────
+# ── Núcleo TCP ────────────────────────────────────────────────────────────────
 
 def _despachar_mensagem(msg: dict) -> None:
-    """Roteia mensagens TCP para a função correta com base no campo 'tipo'."""
+    """Roteamento simples do dicionário JSON para o handler apropriado."""
     rotas = {
         TipoMensagem.REQUISICAO.value: _processar_requisicao,
         TipoMensagem.ACEITE.value:     _processar_aceite,
@@ -362,7 +416,7 @@ def _despachar_mensagem(msg: dict) -> None:
 
 
 def _tratar_conexao(conn, addr) -> None:
-    """Lê a mensagem TCP completa e envia para roteamento."""
+    """Isola a leitura do socket TCP, garantindo que o pool de threads não fique bloqueado."""
     try:
         msg = tcp_receber_completo(conn)
         conn.close()
@@ -372,14 +426,15 @@ def _tratar_conexao(conn, addr) -> None:
         logger.error("[%s] Erro na conexão de %s: %s", BASE_ID, addr, e)
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
-
 def main() -> None:
-    """Inicializa as threads de heartbeat e o servidor TCP."""
+    """Levanta as threads de telemetria UDP e entra no loop principal do servidor TCP."""
     logger.info("[%s] Broker base iniciado. TCP=%d UDP=%d", BASE_ID, MINHA_PORTA, MINHA_PORTA_UDP)
+    
+    # Threads auxiliares em background
     threading.Thread(target=_loop_udp,          daemon=True, name="udp-hb").start()
-    threading.Thread(target=_monitor_heartbeat,  daemon=True, name="mon-hb").start()
+    threading.Thread(target=_monitor_heartbeat, daemon=True, name="mon-hb").start()
 
+    # O servidor TCP roda sobre um Pool para processar vários pacotes paralelos
     servidor = criar_servidor_tcp(MINHA_PORTA)
     with ThreadPoolExecutor(max_workers=16, thread_name_prefix="base") as pool:
         while True:

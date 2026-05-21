@@ -1,6 +1,6 @@
 """
 Testes unitários do Drone — sem dependências externas de rede.
-Execute: python -m pytest test_drone.py -v
+Execute a partir da raiz do projeto: python -m pytest tests/test_drone.py -v
 """
 
 import os
@@ -9,17 +9,29 @@ import threading
 import unittest
 from unittest.mock import patch, MagicMock
 
+# 1. Pega o caminho absoluto da pasta onde este arquivo de teste está (ex: ormuz/tests/)
+PASTA_ATUAL = os.path.dirname(os.path.abspath(__file__))
+# 2. Volta uma pasta para achar a raiz do projeto (ex: ormuz/)
+RAIZ_PROJETO = os.path.abspath(os.path.join(PASTA_ATUAL, ".."))
+
+# 3. Adiciona a raiz do projeto no caminho de importação do Python
+if RAIZ_PROJETO not in sys.path:
+    sys.path.insert(0, RAIZ_PROJETO)
+    
+# 4. Adiciona a pasta shared no caminho
+PASTA_SHARED = os.path.join(RAIZ_PROJETO, "shared")
+if PASTA_SHARED not in sys.path:
+    sys.path.insert(0, PASTA_SHARED)
+# -----------------------------------------
+
 # Injeta variáveis de ambiente antes de importar os módulos
 os.environ.setdefault("DRONE_ID", "drone-test-01")
 os.environ.setdefault("BASE_ORIGEM", "NORTE")
 os.environ.setdefault("IP_BASE", "127.0.0.1")
 
-# Garante que a pasta shared é encontrada nos testes
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared"))
-
 # pylint: disable=import-error, wrong-import-position
 from constantes import EstadoDrone, TipoMensagem
-import drone  # Importa o módulo do drone atualizado
+from drone import drone  # <--- IMPORT CORRIGIDO: importa o módulo drone da pasta drone/
 
 
 # ---------------------------------------------------------------------------
@@ -77,7 +89,8 @@ class TestDroneFuncoes(unittest.TestCase):
         # Garante que o drone global comece livre antes de cada teste
         drone.drone.liberar()
 
-    @patch("drone.tcp_enviar")
+    # O patch agora aponta corretamente para o módulo "drone.drone" (pasta.arquivo)
+    @patch("drone.drone.tcp_enviar")
     def test_registrar_na_base_sucesso(self, mock_tcp_enviar):
         # Configura o mock para simular um envio bem-sucedido de primeira
         mock_tcp_enviar.return_value = True
@@ -91,8 +104,8 @@ class TestDroneFuncoes(unittest.TestCase):
         self.assertEqual(msg_enviada["drone_id"], "drone-test-01")
         self.assertEqual(msg_enviada["base_id"], "NORTE")
 
-    @patch("drone.time.sleep")
-    @patch("drone.tcp_enviar")
+    @patch("drone.drone.time.sleep")
+    @patch("drone.drone.tcp_enviar")
     def test_executar_missao(self, mock_tcp_enviar, mock_sleep):
         dados_missao = {
             "id_requisicao": "req-999",

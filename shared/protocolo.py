@@ -1,8 +1,9 @@
 """
 protocolo.py — Camada de rede (Ormuz Command Center).
 
-Implementa comunicação TCP (garantida) usando framing length-prefix (4 bytes),
-e UDP (telemetria/heartbeats) em modo fire-and-forget.
+Aqui fica toda a comunicação entre as máquinas.
+- Usamos TCP para mensagens que não podem ser perdidas de jeito nenhum.
+- Usamos UDP para mensagens rápidas (como o heartbeat) onde perder uma ou outra não tem problema.
 """
 
 import socket
@@ -18,17 +19,18 @@ logger = logging.getLogger(__name__)
 
 # ── Constantes de rede ───────────────────────────────────────────────────────
 BUFFER_UDP  = 4096
-TIMEOUT_TCP = 2.0  # Timeout curto para evitar bloqueios no broadcast
+TIMEOUT_TCP = 2.0  # Tempo máximo esperando uma resposta antes de desistir
 
 
 # ── TCP — Envio ──────────────────────────────────────────────────────────────
 
 def tcp_enviar(host: str, porta: int, payload: dict, max_tentativas: int = 3) -> bool:
     """
-    Envia payload JSON via TCP prefixado com seu tamanho (4 bytes).
-    Implementa lógica de RETRANSMISSÃO (Retry) em caso de falha de rede.
+    Envia uma mensagem segura via TCP.
+    Se a rede piscar ou falhar, ele tenta enviar de novo automaticamente.
     """
     dados = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    # Coloca o tamanho da mensagem no começo (4 bytes) para quem receber saber o tamanho exato
     header = struct.pack(">I", len(dados))
 
     for tentativa in range(1, max_tentativas + 1):
@@ -49,7 +51,7 @@ def tcp_enviar(host: str, porta: int, payload: dict, max_tentativas: int = 3) ->
 
 
 def tcp_broadcast(destinos: list[tuple[str, int]], payload: dict) -> dict[str, bool]:
-    """Envia payload em paralelo para vários destinos TCP."""
+    """Envia a mesma mensagem para várias máquinas ao mesmo tempo (em paralelo)."""
     resultados: dict[str, bool] = {}
 
     with ThreadPoolExecutor(max_workers=len(destinos), thread_name_prefix="broadcast") as pool:
@@ -65,7 +67,7 @@ def tcp_broadcast(destinos: list[tuple[str, int]], payload: dict) -> dict[str, b
                 logger.warning("[TCP broadcast] Exceção para %s: %s", chave, e)
                 resultados[chave] = False
 
-    # Preenche como False os destinos que não responderam a tempo
+    # Se alguma máquina não respondeu, marca como False (falhou)
     for host, porta in destinos:
         chave = f"{host}:{porta}"
         if chave not in resultados:
@@ -77,13 +79,15 @@ def tcp_broadcast(destinos: list[tuple[str, int]], payload: dict) -> dict[str, b
 # ── TCP — Recebimento ────────────────────────────────────────────────────────
 
 def tcp_receber_completo(conn: socket.socket) -> Optional[dict]:
-    """Lê prefixo de 4 bytes e retorna o payload JSON desserializado."""
+    """Lê a mensagem que chegou da rede e converte de volta para um dicionário Python."""
     try:
+        # Lê os 4 primeiros bytes para descobrir o tamanho da mensagem
         header = _receber_exato(conn, 4)
         if not header:
             return None
 
         tamanho = struct.unpack(">I", header)[0]
+        # Sabendo o tamanho, lê o resto da mensagem exatamente
         dados = _receber_exato(conn, tamanho)
         if not dados:
             return None
@@ -96,7 +100,7 @@ def tcp_receber_completo(conn: socket.socket) -> Optional[dict]:
 
 
 def _receber_exato(conn: socket.socket, n: int) -> Optional[bytes]:
-    """Lê exatamente n bytes do socket."""
+    """Garante que leu a quantidade exata de pedacinhos (bytes) do pacote de rede."""
     buffer = b""
     while len(buffer) < n:
         chunk = conn.recv(n - len(buffer))
@@ -109,9 +113,9 @@ def _receber_exato(conn: socket.socket, n: int) -> Optional[bytes]:
 # ── TCP — Servidor ───────────────────────────────────────────────────────────
 
 def criar_servidor_tcp(porta: int, backlog: int = 10) -> socket.socket:
-    """Cria e retorna um socket TCP passivo configurado para reuso imediato."""
+    """Abre uma 'porta' no computador para ficar escutando conexões TCP chegando."""
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1) # Permite reiniciar rápido sem prender a porta
     s.bind(("0.0.0.0", porta))
     s.listen(backlog)
     logger.info("[TCP] Servidor ouvindo na porta %d", porta)
@@ -121,7 +125,7 @@ def criar_servidor_tcp(porta: int, backlog: int = 10) -> socket.socket:
 # ── UDP — Envio ──────────────────────────────────────────────────────────────
 
 def udp_enviar(host: str, porta: int, payload: dict) -> bool:
-    """Envia payload JSON em um único datagrama UDP."""
+    """Envia uma mensagem rápida (sem garantia de entrega) num pacote único (UDP)."""
     try:
         dados = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
@@ -135,7 +139,7 @@ def udp_enviar(host: str, porta: int, payload: dict) -> bool:
 # ── UDP — Servidor ────────────────────────────────────────────────────────────
 
 def criar_servidor_udp(porta: int) -> socket.socket:
-    """Cria e retorna um socket UDP passivo configurado para reuso imediato."""
+    """Abre uma 'porta' no computador para ficar escutando pacotes UDP chegando."""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind(("0.0.0.0", porta))
@@ -146,7 +150,10 @@ def criar_servidor_udp(porta: int) -> socket.socket:
 # ── Monitor ───────────────────────────────────────────────────────────────────
 
 def notificar_monitor(evento: dict) -> None:
-    """Envia evento ao painel web via UDP ignorando silenciosamente as falhas."""
+    """
+    Avisa o painel web (a tela) sobre o que está acontecendo.
+    Se o painel estiver fechado ou com problema, ele ignora silenciosamente para não travar o sistema inteiro.
+    """
     ip_monitor = os.environ.get("IP_MONITOR", "127.0.0.1")
     porta_monitor = 8000
     try:
@@ -154,4 +161,4 @@ def notificar_monitor(evento: dict) -> None:
         sock.sendto(json.dumps(evento).encode("utf-8"), (ip_monitor, porta_monitor))
         sock.close()
     except Exception:
-        pass  # Evita que o sistema trave caso o monitor esteja offline
+        pass  # Evita que o sistema trave caso o monitor não esteja rodando
