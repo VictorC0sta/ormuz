@@ -186,7 +186,7 @@ Se `tcp_enviar` para o drone falhar em `_despachar_drone`, `_tratar_drone_perdid
 IP_PC_SETORES=<IP do PC 1>
 IP_PC_BASES=<IP do PC 2>
 IP_PC_DRONES=<IP do PC 3>
-IP_PC_SENSORES=<IP do PC 3>
+IP_PC_SENSORES=<IP do PC 4>
 IP_MONITOR=<IP do PC que exibirá o monitor>
 ```
 
@@ -202,12 +202,17 @@ docker compose -f docker/docker-compose.bases.yml up --build
 ```
 Sobe 4 bases (Norte, Sul, Leste, Oeste) nas portas TCP 6001–6004 e UDP 6101–6104.
 
-### PC 3 — Drones e Sensores
+### PC 3 — Drones 
 ```bash
 docker compose -f docker/docker-compose.drones.yml up --build
 docker compose -f docker/docker-compose.sensores.yml up --build
 ```
 Drones escutam TCP nas portas 7001 (Norte), 7011 (Sul), 7021 (Leste), 7031 (Oeste).
+
+### PC 4 - Sensores
+```bash
+docker compose -f docker/docker-compose.sensores.yml up --build
+```
 
 ### Monitor (qualquer PC)
 ```bash
