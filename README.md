@@ -1,4 +1,4 @@
-# Ormuz Command Center
+# Estreito de Ormuz: Central de Comando e Visualização
 ### Infraestrutura Distribuída para Coordenação de Drones Autônomos de Monitoramento Marítimo
 *Disciplina TEC502 — Sistemas Distribuídos · UEFS*
 
