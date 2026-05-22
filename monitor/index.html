@@ -303,7 +303,7 @@ function connectWs() {
         const m=JSON.parse(e.data);
         if(m.tipo==="DRONE_DESPACHADO") log(`[${m.base}] ${m.drone} -> Setor ${m.setor}`,"success");
         else if(m.tipo==="MISSAO_CONCLUIDA") log(`Missao concluida: drone ${m.drone}`,"success");
-        else if(m.tipo==="ALERTA_GERADO") injectAlert(m.setor,"anomalia_menor",m.criticidade);
+        else if(m.tipo==="ALERTA_GERADO") injectAlert(m.setor, m.tipo_ocorrencia || "anomalia_menor", m.criticidade);
         render();
       }catch(e2){}
     };
