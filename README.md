@@ -205,7 +205,6 @@ Sobe 4 bases (Norte, Sul, Leste, Oeste) nas portas TCP 6001–6004 e UDP 6101–
 ### PC 3 — Drones 
 ```bash
 docker compose -f docker/docker-compose.drones.yml up --build
-docker compose -f docker/docker-compose.sensores.yml up --build
 ```
 Drones escutam TCP nas portas 7001 (Norte), 7011 (Sul), 7021 (Leste), 7031 (Oeste).
 
