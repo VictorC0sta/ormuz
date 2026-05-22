@@ -169,6 +169,9 @@ def processar_alerta(msg: dict):
         "tipo": "ALERTA_GERADO",
         "setor": SETOR_ID,
         "criticidade": requisicao.criticidade,
+        "tipo_ocorrencia": requisicao.tipo_ocorrencia, 
+        "id_requisicao": requisicao.id_requisicao,       
+        "timestamp_logico": ts,                          
     })
 
 
